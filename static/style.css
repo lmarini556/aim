@@ -1082,3 +1082,162 @@ nav { display: flex; flex-direction: column; gap: 2px; }
 .pick-row input { accent-color: var(--accent); }
 .pick-row .pick-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pick-row .pick-cwd { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+
+/* ====================================================================== */
+/*  New-instance button (sidebar)                                         */
+/* ====================================================================== */
+.new-instance-btn {
+  margin: 6px 14px 14px;
+  padding: 10px 14px;
+  background: var(--accent);
+  color: #000;
+  font-weight: 700;
+  font-size: 13px;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+  font-family: inherit;
+  letter-spacing: -0.01em;
+  transition: background 0.12s, transform 0.08s;
+  box-shadow: 0 6px 18px -6px var(--accent-ring), 0 0 0 1px rgba(255, 107, 26, 0.25);
+}
+.new-instance-btn:hover { background: var(--accent-bright); }
+.new-instance-btn:active { transform: scale(0.98); }
+body.compact .new-instance-btn { display: none; }
+
+/* ====================================================================== */
+/*  Inline xterm.js terminal (when session is tmux-owned)                 */
+/* ====================================================================== */
+.term-xterm {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  background: #0b0d10;
+  padding: 10px 10px 6px;
+  overflow: hidden;
+}
+.preview-root.has-terminal .term-xterm { display: block; }
+.preview-root.has-terminal .term-body,
+.preview-root.has-terminal .summary-strip,
+.preview-root.has-terminal .subagent-strip { display: none !important; }
+
+.term-xterm .xterm { height: 100%; padding: 4px; }
+.term-xterm .xterm-viewport {
+  background: transparent !important;
+  overflow-y: auto !important;
+  scrollbar-color: var(--border) transparent;
+}
+.term-xterm .xterm-screen { background: transparent !important; }
+
+/* ====================================================================== */
+/*  New-instance modal                                                     */
+/* ====================================================================== */
+.new-instance-modal .modal-card {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  padding: 22px 24px;
+  width: 520px;
+  max-width: 92vw;
+  box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.9);
+}
+.new-instance-modal h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.new-instance-modal .modal-sub {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.new-instance-modal .modal-sub code {
+  background: var(--bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--accent-bright);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.new-instance-modal .modal-label {
+  display: block;
+  margin: 10px 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted-strong);
+}
+.new-instance-modal .modal-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 9px 11px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-family: var(--mono);
+  outline: none;
+  box-sizing: border-box;
+}
+.new-instance-modal .modal-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.new-instance-modal .recent-cwds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.new-instance-modal .recent-cwd-chip {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted-strong);
+  padding: 4px 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.1s;
+}
+.new-instance-modal .recent-cwd-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent-bright);
+  background: var(--accent-softer);
+}
+.new-instance-modal .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+.new-instance-modal .modal-btn {
+  padding: 8px 16px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted-strong);
+  transition: all 0.12s;
+}
+.new-instance-modal .modal-btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+}
+.new-instance-modal .modal-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #000;
+}
+.new-instance-modal .modal-btn.primary:hover {
+  background: var(--accent-bright);
+  border-color: var(--accent-bright);
+}

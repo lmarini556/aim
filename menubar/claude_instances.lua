@@ -7,7 +7,30 @@ local M = {}
 local CIU_HOST = os.getenv("CIU_HOST") or "127.0.0.1"
 local CIU_PORT = os.getenv("CIU_PORT") or "7878"
 local BASE_URL = os.getenv("CIU_PUBLIC_URL") or ("http://" .. CIU_HOST .. ":" .. CIU_PORT)
+local TOKEN_FILE = os.getenv("HOME") .. "/.claude-instances-ui/token"
+
+local function readFileQuick(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local s = f:read("*a")
+  f:close()
+  return s
+end
+
+local function loadToken()
+  local raw = readFileQuick(TOKEN_FILE) or ""
+  return (raw:gsub("%s+$", ""))
+end
+
+local AUTH_TOKEN = loadToken()
+local AUTH_HEADERS = AUTH_TOKEN ~= "" and { Authorization = "Bearer " .. AUTH_TOKEN } or nil
+
 local DASHBOARD_URL = BASE_URL .. "/?compact=1"
+-- Dashboard popover can't set the cookie itself; pass the token via query so
+-- the /auth redirect sets the cookie before loading the compact page.
+if AUTH_TOKEN ~= "" then
+  DASHBOARD_URL = BASE_URL .. "/auth?t=" .. AUTH_TOKEN
+end
 local API_URL = BASE_URL .. "/api/instances"
 local POLL_SECONDS = 4
 local FRESH_WINDOW = 300
@@ -77,7 +100,7 @@ local function notify(title, body)
 end
 
 local function fetchInstances(callback)
-  hs.http.asyncGet(API_URL, nil, function(status, body, _)
+  hs.http.asyncGet(API_URL, AUTH_HEADERS, function(status, body, _)
     if status ~= 200 or not body then callback(nil) return end
     local ok, data = pcall(hs.json.decode, body)
     callback(ok and data or nil)

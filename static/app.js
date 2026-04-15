@@ -11,6 +11,7 @@ const state = {
   pinScroll: true,
   lastListSig: "",
   pendingAcks: {},
+  activeTerm: null, // {terminal, fitAddon, ws, sid, host, resizeHandler}
 };
 
 const FRESH_WINDOW_SECONDS = 300;
@@ -114,27 +115,24 @@ function renderListCard(inst) {
   node.dataset.sid = inst.session_id;
   updateListCard(node, inst);
   const isCompact = () => document.body.classList.contains("compact");
-  const focusAndClose = () => {
-    acknowledge(inst.session_id, inst.hook_timestamp);
-    api("POST", `/api/instances/${inst.session_id}/focus`).then((r) => {
-      if (!r.ok) {
-        toast(`No iTerm2 tab matched (tried ${r.tried?.join(", ")})`, { error: true });
-      } else if (isCompact()) {
-        window.location.href = "ciu://close";
-      }
-    }).catch((err) => toast(err.message, { error: true }));
-  };
   node.addEventListener("click", () => {
     acknowledge(inst.session_id, inst.hook_timestamp);
     if (isCompact()) {
-      renderList();
+      // In compact tray mode: open the full dashboard focused on this sid
+      api("POST", "/api/open-dashboard").catch(() => {});
+      window.location.href = "ciu://close";
       return;
     }
     selectInstance(inst.session_id);
   });
   node.addEventListener("dblclick", (e) => {
     e.preventDefault();
-    focusAndClose();
+    // Double-click focuses the terminal (if already selected + tmux-owned)
+    if (state.selectedSid === inst.session_id && state.activeTerm) {
+      try { state.activeTerm.terminal.focus(); } catch {}
+    } else {
+      selectInstance(inst.session_id);
+    }
   });
   wireDragAndDrop(node, inst.session_id);
   return node;
@@ -185,6 +183,7 @@ function updateListCard(node, inst) {
 
 function selectInstance(sid) {
   if (state.selectedSid === sid) return;
+  unmountTerminal();
   state.selectedSid = sid;
   state.transcriptData = null;
   state.renderedUuids = new Set();
@@ -284,6 +283,96 @@ function renderList() {
   }
 }
 
+/* Terminal (xterm.js) */
+function mountTerminal(host, sessionId) {
+  unmountTerminal();
+  if (!window.Terminal) {
+    host.textContent = "xterm.js failed to load (check network)";
+    return;
+  }
+  host.innerHTML = "";
+  const term = new window.Terminal({
+    cursorBlink: true,
+    fontFamily: "ui-monospace, Menlo, Consolas, monospace",
+    fontSize: 13,
+    lineHeight: 1.15,
+    scrollback: 10000,
+    allowProposedApi: true,
+    theme: {
+      background: "#0b0d10",
+      foreground: "#d6d6d6",
+      cursor: "#ffbf69",
+      selectionBackground: "#ffbf6933",
+    },
+  });
+  let fitAddon = null;
+  if (window.FitAddon && window.FitAddon.FitAddon) {
+    fitAddon = new window.FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+  }
+  term.open(host);
+  if (fitAddon) {
+    try { fitAddon.fit(); } catch {}
+  }
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/instances/${sessionId}/terminal`);
+  ws.binaryType = "arraybuffer";
+
+  const sendResize = () => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+  };
+
+  ws.addEventListener("open", () => {
+    if (fitAddon) {
+      try { fitAddon.fit(); } catch {}
+    }
+    sendResize();
+  });
+  ws.addEventListener("message", (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(e.data));
+    } else {
+      term.write(e.data);
+    }
+  });
+  ws.addEventListener("close", () => {
+    term.write("\r\n\x1b[90m[disconnected]\x1b[0m\r\n");
+  });
+  ws.addEventListener("error", () => {
+    term.write("\r\n\x1b[31m[websocket error]\x1b[0m\r\n");
+  });
+
+  term.onData((data) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "input", data }));
+    }
+  });
+
+  term.onResize(() => sendResize());
+
+  const resizeHandler = () => {
+    if (fitAddon) {
+      try { fitAddon.fit(); } catch {}
+    }
+  };
+  window.addEventListener("resize", resizeHandler);
+
+  state.activeTerm = { terminal: term, fitAddon, ws, sid: sessionId, host, resizeHandler };
+  setTimeout(() => { try { term.focus(); } catch {} }, 30);
+}
+
+function unmountTerminal() {
+  const at = state.activeTerm;
+  if (!at) return;
+  state.activeTerm = null;
+  try { window.removeEventListener("resize", at.resizeHandler); } catch {}
+  try { at.ws.close(); } catch {}
+  try { at.terminal.dispose(); } catch {}
+  if (at.host) at.host.innerHTML = "";
+}
+
 /* Preview */
 async function loadTranscript() {
   if (!state.selectedSid) return;
@@ -316,14 +405,17 @@ function renderPreview() {
   const shell = ensurePreviewShell();
 
   const sidChanged = state.renderedSid !== session.session_id;
+  const hasTmux = !!session.tmux_session;
+
   if (sidChanged) {
     state.renderedUuids = new Set();
     state.renderedSid = session.session_id;
-    $("#termLog", shell).innerHTML = "";
+    const log = $("#termLog", shell);
+    if (log) log.innerHTML = "";
     state.pinScroll = true;
   }
 
-  shell.className = `preview-root ${session.status}`;
+  shell.className = `preview-root ${session.status}` + (hasTmux ? " has-terminal" : "");
   const headSprite = $(".term-title-sprite", shell);
   if (headSprite && headSprite.dataset.sid !== session.session_id) {
     headSprite.innerHTML = window.agentSprite ? window.agentSprite(session.session_id) : "";
@@ -354,19 +446,37 @@ function renderPreview() {
   renderSummary(shell, session.summary);
   renderSubagents(shell, session.subagents || []);
 
-  $(".tp-path", shell).textContent = truncCwd(session.cwd);
   const focusBtn = $(".ph-focus", shell);
-  focusBtn.disabled = !session.tty;
+
+  // Branch: tmux-owned → xterm.js. Otherwise → read-only transcript view.
+  if (hasTmux) {
+    const host = $("#xtermHost", shell);
+    const needsMount = !state.activeTerm || state.activeTerm.sid !== session.session_id;
+    if (needsMount && host) mountTerminal(host, session.session_id);
+    focusBtn.disabled = false;
+    focusBtn.title = "Focus terminal";
+    return;
+  }
+
+  // External (non-tmux) session path: transcript preview
+  unmountTerminal();
+  focusBtn.disabled = true;
+  focusBtn.title = "External session — no interactive terminal available";
+
+  const tpPath = $(".tp-path", shell);
+  if (tpPath) tpPath.textContent = truncCwd(session.cwd);
 
   const footerStatus = $(".term-footer-status", shell);
-  if (session.status === "running") {
-    footerStatus.innerHTML = `<span style="color:var(--accent-bright)">▸ running</span>${session.last_tool ? ` · <span style="color:var(--muted-strong)">${escapeHtml(session.last_tool)}</span>` : ""}`;
-  } else if (session.status === "needs_input") {
-    footerStatus.innerHTML = `<span style="color:var(--accent-bright)">! waiting for you</span>`;
-  } else if (session.status === "idle") {
-    footerStatus.innerHTML = `<span style="color:var(--muted-strong)">● idle</span>${session.hook_timestamp ? ` · ${relTime(session.hook_timestamp)} ago` : ""}`;
-  } else {
-    footerStatus.innerHTML = `<span style="color:var(--muted)">× ended</span>`;
+  if (footerStatus) {
+    if (session.status === "running") {
+      footerStatus.innerHTML = `<span style="color:var(--accent-bright)">▸ running</span>${session.last_tool ? ` · <span style="color:var(--muted-strong)">${escapeHtml(session.last_tool)}</span>` : ""}`;
+    } else if (session.status === "needs_input") {
+      footerStatus.innerHTML = `<span style="color:var(--accent-bright)">! waiting for you</span>`;
+    } else if (session.status === "idle") {
+      footerStatus.innerHTML = `<span style="color:var(--muted-strong)">● idle</span>${session.hook_timestamp ? ` · ${relTime(session.hook_timestamp)} ago` : ""}`;
+    } else {
+      footerStatus.innerHTML = `<span style="color:var(--muted)">× ended</span>`;
+    }
   }
 
   renderTermLog(shell, entries);
@@ -579,15 +689,9 @@ function wirePreviewActions(shell) {
 
   const focusBtnWire = $(".ph-focus", shell);
   focusBtnWire.addEventListener("click", () => {
-    const s = sess(); if (!s) return;
-    focusBtnWire.disabled = true;
-    focusBtnWire.textContent = "…";
-    api("POST", `/api/instances/${s.session_id}/focus`).then((r) => {
-      if (!r.ok) toast(`No iTerm2 tab matched (tried ${r.tried?.join(", ")})`, { error: true });
-    }).catch((e) => toast(e.message, { error: true })).finally(() => {
-      focusBtnWire.disabled = false;
-      focusBtnWire.textContent = "⤴";
-    });
+    if (state.activeTerm) {
+      try { state.activeTerm.terminal.focus(); } catch {}
+    }
   });
 
   $(".ph-rename", shell).addEventListener("click", () => {
@@ -633,11 +737,21 @@ function wirePreviewActions(shell) {
       const act = btn.dataset.act;
       if (act === "sigint") {
         await api("POST", `/api/instances/${s.session_id}/signal`, { signal: "INT" });
-        toast(`SIGINT sent to pid ${s.pid}`);
+        toast("SIGINT sent");
       } else if (act === "sigterm") {
-        if (!confirm(`SIGTERM pid ${s.pid}?`)) return;
+        if (!confirm(`SIGTERM this session?`)) return;
         await api("POST", `/api/instances/${s.session_id}/signal`, { signal: "TERM" });
-        toast(`SIGTERM sent to pid ${s.pid}`);
+        toast("SIGTERM sent");
+      } else if (act === "kill") {
+        if (!s.tmux_session) {
+          toast("Not a tmux-owned session", { error: true });
+          return;
+        }
+        if (!confirm(`Kill tmux session ${s.tmux_session}?`)) return;
+        await api("POST", `/api/instances/${s.session_id}/kill`);
+        unmountTerminal();
+        toast("Session killed");
+        refresh();
       } else if (act === "forget") {
         await api("DELETE", `/api/instances/${s.session_id}`);
         state.selectedSid = null;
@@ -1143,6 +1257,86 @@ $("#showEnded").addEventListener("change", (e) => {
 });
 
 $("#newGroupBtn").addEventListener("click", promptNewGroup);
+
+async function showNewInstanceModal() {
+  const tpl = $("#newInstanceModalTpl");
+  if (!tpl) return;
+  const bd = tpl.content.firstElementChild.cloneNode(true);
+  document.body.append(bd);
+  const close = () => bd.remove();
+  const cwdInput = $(".cwd-input", bd);
+  const cmdInput = $(".cmd-input", bd);
+  const datalist = $("#recentCwdsList", bd);
+  const recentBox = $(".recent-cwds", bd);
+
+  try {
+    const { cwds } = await api("GET", "/api/recent-cwds");
+    for (const c of cwds) {
+      const opt = document.createElement("option");
+      opt.value = c;
+      datalist.append(opt);
+    }
+    for (const c of cwds.slice(0, 6)) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "recent-cwd-chip";
+      btn.textContent = c.replace(/^\/Users\/[^/]+/, "~");
+      btn.title = c;
+      btn.addEventListener("click", () => {
+        cwdInput.value = c;
+        cwdInput.focus();
+      });
+      recentBox.append(btn);
+    }
+  } catch {}
+
+  const submit = async () => {
+    const cwd = cwdInput.value.trim();
+    const command = cmdInput.value.trim() || "claude";
+    if (!cwd) { cwdInput.focus(); return; }
+    try {
+      const resolved = cwd.startsWith("~") ? cwd.replace(/^~/, getHome()) : cwd;
+      const res = await api("POST", "/api/instances/new", { cwd: resolved, command });
+      close();
+      toast("Starting…");
+      // Poll up to 5s for the new session to appear, then select it
+      const deadline = Date.now() + 5000;
+      const tick = async () => {
+        await refresh();
+        const match = state.instances.find((i) => i.our_sid === res.our_sid);
+        if (match) {
+          selectInstance(match.session_id);
+          return;
+        }
+        if (Date.now() < deadline) setTimeout(tick, 300);
+      };
+      tick();
+    } catch (e) {
+      toast(`Failed: ${e.message}`, { error: true });
+    }
+  };
+
+  $(".cancel", bd).addEventListener("click", close);
+  $(".ok", bd).addEventListener("click", submit);
+  bd.addEventListener("click", (e) => { if (e.target === bd) close(); });
+  bd.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+    if (e.key === "Enter" && (e.target === cwdInput || e.target === cmdInput)) submit();
+  });
+  setTimeout(() => cwdInput.focus(), 20);
+}
+
+function getHome() {
+  // Best-effort: infer from any known cwd that starts with /Users/
+  for (const i of state.instances) {
+    const m = (i.cwd || "").match(/^(\/Users\/[^/]+)/);
+    if (m) return m[1];
+  }
+  return "";
+}
+
+const newInstanceBtn = $("#newInstanceBtn");
+if (newInstanceBtn) newInstanceBtn.addEventListener("click", showNewInstanceModal);
 
 $("#openFullBtn").addEventListener("click", () => {
   api("POST", "/api/open-dashboard").catch((e) => toast(e.message, { error: true }));

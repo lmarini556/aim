@@ -6,6 +6,7 @@
     <title>Claude Instances</title>
     <link rel="preconnect" href="https://rsms.me/" />
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
@@ -14,6 +15,7 @@
         <span class="logo"></span>
         <span>Claude</span>
       </div>
+      <button id="newInstanceBtn" class="new-instance-btn" title="New Claude instance (tmux)">＋  New instance</button>
       <nav>
         <button class="nav" data-filter="all"><span class="dot"></span>All<span class="count" data-count="all"></span></button>
         <button class="nav" data-filter="needs_input"><span class="dot needs_input"></span>Needs input<span class="count" data-count="needs_input"></span></button>
@@ -50,7 +52,7 @@
         <div class="empty">
           <div class="empty-cursor">█</div>
           <h3>No instance selected</h3>
-          <p>Pick one on the left to see its terminal.</p>
+          <p>Pick one on the left or click <b>＋ New instance</b> to start one.</p>
         </div>
       </div>
     </section>
@@ -83,14 +85,15 @@
             <span class="term-title-status"></span>
           </div>
           <div class="term-actions">
-            <button class="term-btn ph-focus" title="Jump to terminal">⤴</button>
+            <button class="term-btn ph-focus" title="Focus terminal">⌨</button>
             <button class="term-btn ph-rename" title="Rename">✎</button>
             <button class="term-btn ph-group" title="Set group">▦</button>
             <div class="menu-wrap">
               <button class="term-btn ph-more" title="More">⋯</button>
               <div class="menu">
-                <button data-act="sigint">Send SIGINT</button>
+                <button data-act="sigint">Send SIGINT (Ctrl-C)</button>
                 <button data-act="sigterm" class="danger">Send SIGTERM</button>
+                <button data-act="kill" class="danger">Kill tmux session</button>
                 <button data-act="forget">Forget state</button>
               </div>
             </div>
@@ -114,6 +117,8 @@
           </div>
         </div>
 
+        <div class="term-xterm" id="xtermHost"></div>
+
         <div class="term-body" id="termBody">
           <div class="term-prompt"><span class="tp-path"></span><span class="tp-cmd">claude</span></div>
           <div class="term-log" id="termLog"></div>
@@ -125,8 +130,29 @@
       </div>
     </template>
 
+    <template id="newInstanceModalTpl">
+      <div class="modal-backdrop new-instance-modal">
+        <div class="modal-card">
+          <h2>New Claude instance</h2>
+          <p class="modal-sub">Spawns a <code>claude</code> session inside tmux. It will appear in the list as soon as the first hook fires.</p>
+          <label class="modal-label">Working directory</label>
+          <input class="modal-input cwd-input" placeholder="/path/to/project" list="recentCwdsList" autofocus />
+          <datalist id="recentCwdsList"></datalist>
+          <div class="recent-cwds"></div>
+          <label class="modal-label">Command</label>
+          <input class="modal-input cmd-input" value="claude" />
+          <div class="modal-actions">
+            <button class="modal-btn cancel">Cancel</button>
+            <button class="modal-btn primary ok">Start</button>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <div id="toast"></div>
-    <script src="/static/sprite.js?v=13"></script>
-    <script src="/static/app.js?v=13"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="/static/sprite.js?v=14"></script>
+    <script src="/static/app.js?v=14"></script>
   </body>
 </html>

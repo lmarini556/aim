@@ -92,6 +92,7 @@ def safe_main():
             "cwd": payload.get("cwd") or existing.get("cwd"),
             "transcript_path": payload.get("transcript_path") or existing.get("transcript_path"),
             "notification_message": notification_message,
+            "our_sid": os.environ.get("CLAUDE_INSTANCES_UI_OWNED") or existing.get("our_sid"),
             "timestamp": time.time(),
         }
     )

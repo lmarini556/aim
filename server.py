@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn[standard]", "httpx"]
+# dependencies = ["fastapi", "uvicorn[standard]", "httpx", "websockets"]
 # ///
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
 import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -17,12 +19,13 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import summarizer
+import tmux_backend
 
 HOME = pathlib.Path.home()
 CLAUDE_DIR = HOME / ".claude"
@@ -43,86 +46,42 @@ PUBLIC_BASE_URL = os.environ.get("CIU_PUBLIC_URL") or f"http://{HOST}:{PORT}"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-_ITERM_CACHE: dict = {"at": 0.0, "map": {}, "sessions": {}}
-_ITERM_TTL = 3.0
-_ITERM_SCRIPT = '''tell application "iTerm2"
-  set out to ""
-  repeat with w in windows
-    set wid to id of w
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        set uid to unique id of s
-        set out to out & (tty of s) & "||" & (name of s) & "||" & wid & "||" & uid & linefeed
-      end repeat
-    end repeat
-  end repeat
-  return out
-end tell'''
-_TITLE_RE = re.compile(r"^[^\w\s]+\s*(.+?)\s*(\([^)]*\))?\s*$")
+# ----------------------------------------------------------------------------
+# Auth
+# ----------------------------------------------------------------------------
+
+TOKEN_FILE = APP_DIR / "token"
 
 
-def _refresh_iterm_cache() -> None:
-    now = time.time()
-    if now - _ITERM_CACHE["at"] < _ITERM_TTL:
-        return
-    mapping: dict[str, str] = {}
-    sessions: dict[str, dict] = {}
+def _load_or_create_token() -> str:
     try:
-        out = subprocess.run(
-            ["osascript", "-e", _ITERM_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        ).stdout
-        for line in out.splitlines():
-            parts = line.split("||")
-            if len(parts) < 4:
-                continue
-            tty = parts[0].strip()
-            name = parts[1].strip()
-            wid = parts[2].strip()
-            uid = parts[3].strip()
-            mapping[tty] = name
-            sessions[tty] = {"name": name, "wid": wid, "uid": uid}
+        if TOKEN_FILE.exists():
+            t = TOKEN_FILE.read_text().strip()
+            if t:
+                return t
     except Exception:
-        mapping = _ITERM_CACHE.get("map", {})
-        sessions = _ITERM_CACHE.get("sessions", {})
-    _ITERM_CACHE["at"] = now
-    _ITERM_CACHE["map"] = mapping
-    _ITERM_CACHE["sessions"] = sessions
+        pass
+    t = secrets.token_urlsafe(32)
+    TOKEN_FILE.write_text(t)
+    try:
+        TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return t
 
 
-def iterm_names() -> dict[str, str]:
-    _refresh_iterm_cache()
-    return _ITERM_CACHE["map"]
+AUTH_TOKEN = _load_or_create_token()
+COOKIE_NAME = "ciu_token"
 
 
-def iterm_session_for_tty(ttys: list[str]) -> dict | None:
-    _refresh_iterm_cache()
-    sessions = _ITERM_CACHE.get("sessions", {})
-    for t in ttys:
-        key = t if t.startswith("/dev/") else f"/dev/{t}"
-        if key in sessions:
-            return sessions[key]
-        bare = t.lstrip("/dev/") if t.startswith("/dev/") else t
-        alt = f"/dev/{bare}"
-        if alt in sessions:
-            return sessions[alt]
-    return None
-
-
-def extract_claude_title(iterm_name: str | None) -> str | None:
-    if not iterm_name:
-        return None
-    if ord(iterm_name[0]) < 128:
-        return None
-    m = _TITLE_RE.match(iterm_name)
-    if not m:
-        return None
-    title = m.group(1).strip()
-    if not title or title.startswith(("/", "~")):
-        return None
-    return title
+def _is_authenticated(request: Request) -> bool:
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], AUTH_TOKEN):
+        return True
+    cookie = request.cookies.get(COOKIE_NAME) or ""
+    if cookie and secrets.compare_digest(cookie, AUTH_TOKEN):
+        return True
+    return False
 
 
 def reclassify_notification(msg: str | None) -> str:
@@ -558,13 +517,10 @@ def display_name(
     session_id: str,
     cwd: str | None,
     jsonl_title: str | None,
-    iterm_title: str | None,
     names: dict,
 ) -> str:
     if session_id in names and names[session_id]:
         return names[session_id]
-    if iterm_title:
-        return iterm_title
     if jsonl_title:
         return jsonl_title
     base = pathlib.Path(cwd).name if cwd else "unknown"
@@ -679,17 +635,8 @@ def gather_instances() -> list[dict]:
     names = read_json(NAMES_FILE)
     groups = read_json(GROUPS_FILE)
     acks = read_json(ACKS_FILE)
-    iterm = iterm_names()
+    tmux_sessions_by_sid: dict[str, str] = {s.our_sid: s.name for s in tmux_backend.list_sessions()}
     by_session: dict[str, dict] = {}
-
-    def iterm_title_for(ttys: list[str]) -> str | None:
-        for t in ttys:
-            key = t if t.startswith("/dev/") else f"/dev/{t}"
-            raw = iterm.get(key) or iterm.get(t)
-            title = extract_claude_title(raw)
-            if title:
-                return title
-        return None
 
     if SESSIONS_DIR.exists():
         for sf in SESSIONS_DIR.glob("*.json"):
@@ -706,8 +653,9 @@ def gather_instances() -> list[dict]:
             ttys = walk_ttys(pid) if alive else []
             cwd = data.get("cwd")
             hook_state = read_json(STATE_DIR / f"{sid}.json")
+            our_sid = hook_state.get("our_sid")
+            tmux_name = tmux_sessions_by_sid.get(our_sid) if our_sid else None
             jsonl_title, first_user = session_title(sid, cwd)
-            iterm_title = iterm_title_for(ttys) if alive else None
             tail = jsonl_tail(sid, cwd)
             summary = jsonl_summary(sid, cwd)
             mcps = load_mcps(cwd, command)
@@ -717,8 +665,8 @@ def gather_instances() -> list[dict]:
                 "session_id": sid,
                 "pid": pid,
                 "alive": alive,
-                "name": display_name(sid, cwd, jsonl_title, iterm_title, names),
-                "title": iterm_title or jsonl_title,
+                "name": display_name(sid, cwd, jsonl_title, names),
+                "title": jsonl_title,
                 "custom_name": names.get(sid),
                 "first_user": first_user,
                 "cwd": cwd,
@@ -738,6 +686,8 @@ def gather_instances() -> list[dict]:
                 "subagents": subagents,
                 "group": next((g for g, ids in groups.items() if sid in ids), None),
                 "ack_timestamp": acks.get(sid) or 0,
+                "our_sid": our_sid,
+                "tmux_session": tmux_name,
             }
 
     now_ts = time.time()
@@ -758,11 +708,13 @@ def gather_instances() -> list[dict]:
         orphan_count += 1
         cwd = data.get("cwd")
         jsonl_title, first_user = session_title(sid, cwd)
+        our_sid = data.get("our_sid")
+        tmux_name = tmux_sessions_by_sid.get(our_sid) if our_sid else None
         by_session[sid] = {
             "session_id": sid,
             "pid": None,
             "alive": False,
-            "name": display_name(sid, cwd, jsonl_title, None, names),
+            "name": display_name(sid, cwd, jsonl_title, names),
             "title": jsonl_title,
             "custom_name": names.get(sid),
             "first_user": first_user,
@@ -779,6 +731,8 @@ def gather_instances() -> list[dict]:
             "group": next((g for g, ids in groups.items() if sid in ids), None),
             "ack_timestamp": acks.get(sid) or 0,
             "ttys": [],
+            "our_sid": our_sid,
+            "tmux_session": tmux_name,
         }
 
     def _sort_key(x: dict) -> tuple:
@@ -858,83 +812,24 @@ def api_set_group(session_id: str, body: GroupBody) -> dict:
     return {"ok": True}
 
 
-@app.post("/api/instances/{session_id}/focus")
-def api_focus(session_id: str) -> dict:
-    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="session not found")
-    ttys = target.get("ttys") or ([target["tty"]] if target.get("tty") else [])
-    if not ttys:
-        raise HTTPException(status_code=404, detail="no tty for process")
-
-    _ITERM_CACHE["at"] = 0
-    iterm_sess = iterm_session_for_tty(ttys)
-    if iterm_sess:
-        wid = iterm_sess["wid"]
-        uid = iterm_sess["uid"]
-        script = f'''tell application "iTerm2"
-  repeat with w in windows
-    if id of w is {wid} then
-      set index of w to 1
-      repeat with t in tabs of w
-        repeat with s in sessions of t
-          if unique id of s is "{uid}" then
-            tell t to select
-            select s
-            activate
-            return "ok"
-          end if
-        end repeat
-      end repeat
-    end if
-  end repeat
-end tell
-return "not_found"
-'''
-        result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=5
-        )
-        ok = result.stdout.strip().startswith("ok")
-        return {"ok": ok, "matched": uid, "tried": ttys}
-
-    normalized = [t if t.startswith("/dev/") else f"/dev/{t}" for t in ttys]
-    tty_list = "{" + ", ".join(f'"{t}"' for t in normalized) + "}"
-    script = f'''tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        repeat with target in {tty_list}
-          if tty of s is (target as string) then
-            set index of w to 1
-            tell t to select
-            select s
-            activate
-            return "ok:" & (tty of s)
-          end if
-        end repeat
-      end repeat
-    end repeat
-  end repeat
-end tell
-return "not_found"
-'''
-    result = subprocess.run(
-        ["osascript", "-e", script], capture_output=True, text=True, timeout=5
-    )
-    ok = result.stdout.strip().startswith("ok")
-    return {"ok": ok, "matched": result.stdout.strip(), "tried": normalized}
-
-
 @app.post("/api/instances/{session_id}/signal")
 def api_signal(session_id: str, body: KillBody) -> dict:
     target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
-    if not target or not target.get("pid"):
+    if not target:
+        raise HTTPException(status_code=404, detail="session not found")
+    sig_name = body.signal.upper()
+    # Prefer tmux-backed send via pane fg-process if the session is ours
+    if target.get("our_sid") and target.get("tmux_session"):
+        tmux_backend.send_signal(target["our_sid"], sig_name)
+        return {"ok": True, "route": "tmux"}
+    pid = target.get("pid")
+    if not pid:
         raise HTTPException(status_code=404, detail="pid not found")
-    sig = getattr(signal, f"SIG{body.signal}", None)
+    sig = getattr(signal, f"SIG{sig_name}", None)
     if sig is None:
         raise HTTPException(status_code=400, detail="unknown signal")
-    os.kill(target["pid"], sig)
-    return {"ok": True}
+    os.kill(pid, sig)
+    return {"ok": True, "route": "pid"}
 
 
 @app.delete("/api/instances/{session_id}")
@@ -943,6 +838,147 @@ def api_forget(session_id: str) -> dict:
     if sf.exists():
         sf.unlink()
     return {"ok": True}
+
+
+class NewInstanceBody(BaseModel):
+    cwd: str
+    command: str = "claude"
+
+
+@app.post("/api/instances/new")
+def api_new_instance(body: NewInstanceBody) -> dict:
+    if not tmux_backend.tmux_available():
+        raise HTTPException(
+            status_code=503,
+            detail="tmux is not installed. Run: brew install tmux",
+        )
+    cwd_path = pathlib.Path(body.cwd).expanduser()
+    if not cwd_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"not a directory: {body.cwd}")
+    try:
+        our_sid = tmux_backend.spawn(str(cwd_path), body.command)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    # Invalidate cache so new session appears on next poll
+    _INSTANCES_CACHE["at"] = 0
+    return {"ok": True, "our_sid": our_sid}
+
+
+@app.post("/api/instances/{session_id}/kill")
+def api_kill_instance(session_id: str) -> dict:
+    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="session not found")
+    our_sid = target.get("our_sid")
+    if not our_sid:
+        raise HTTPException(status_code=400, detail="session is not tmux-owned")
+    tmux_backend.kill(our_sid)
+    _INSTANCES_CACHE["at"] = 0
+    return {"ok": True}
+
+
+@app.get("/api/recent-cwds")
+def api_recent_cwds() -> dict:
+    """Return a list of recently-used cwds (pulled from ~/.claude/projects/ dir names
+    plus current live sessions). Useful for the new-instance modal picker."""
+    seen: dict[str, float] = {}
+    # Current live sessions take priority
+    for inst in cached_instances():
+        cwd = inst.get("cwd")
+        if not cwd:
+            continue
+        seen[cwd] = max(seen.get(cwd, 0), inst.get("hook_timestamp") or 0)
+    # Claude projects dir slugs: each dir name like "-Users-lukemarini-..." decodes to a cwd
+    if PROJECTS_DIR.exists():
+        for p in PROJECTS_DIR.iterdir():
+            if not p.is_dir():
+                continue
+            slug = p.name
+            if not slug.startswith("-"):
+                continue
+            cwd = "/" + slug[1:].replace("-", "/")
+            # Only keep cwds that actually exist
+            if not pathlib.Path(cwd).is_dir():
+                continue
+            mtime = p.stat().st_mtime
+            seen[cwd] = max(seen.get(cwd, 0), mtime)
+    rows = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)
+    return {"cwds": [c for c, _ in rows[:50]]}
+
+
+@app.websocket("/ws/instances/{session_id}/terminal")
+async def ws_terminal(ws: WebSocket, session_id: str) -> None:
+    # Manual auth: accept then validate, then close on mismatch.
+    # FastAPI doesn't pass Request to ws handlers through middleware.
+    token = ws.query_params.get("t") or ""
+    cookie = ws.cookies.get(COOKIE_NAME) or ""
+    if not (
+        (token and secrets.compare_digest(token, AUTH_TOKEN))
+        or (cookie and secrets.compare_digest(cookie, AUTH_TOKEN))
+    ):
+        await ws.close(code=4401)
+        return
+    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
+    if not target or not target.get("our_sid"):
+        await ws.close(code=4404)
+        return
+    our_sid = target["our_sid"]
+    if not tmux_backend.session_exists(our_sid):
+        await ws.close(code=4404)
+        return
+    await ws.accept()
+
+    # Send initial scrollback
+    snapshot = tmux_backend.capture_pane(our_sid, lines=1000)
+    if snapshot:
+        try:
+            await ws.send_bytes(snapshot)
+        except Exception:
+            return
+
+    send_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def forward_output() -> None:
+        try:
+            async for chunk in tmux_backend.stream_output(our_sid):
+                await ws.send_bytes(chunk)
+        except Exception:
+            pass
+
+    out_task = asyncio.create_task(forward_output())
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if "bytes" in msg and msg["bytes"] is not None:
+                tmux_backend.send_bytes(our_sid, msg["bytes"])
+            elif "text" in msg and msg["text"] is not None:
+                text = msg["text"]
+                # Text frames are JSON control messages: {"type":"input"|"resize", ...}
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    # Legacy: treat as raw keystrokes
+                    tmux_backend.send_bytes(our_sid, text.encode("utf-8"))
+                    continue
+                kind = payload.get("type")
+                if kind == "input":
+                    data = payload.get("data", "")
+                    if isinstance(data, str) and data:
+                        tmux_backend.send_bytes(our_sid, data.encode("utf-8"))
+                elif kind == "resize":
+                    cols = int(payload.get("cols") or 80)
+                    rows = int(payload.get("rows") or 24)
+                    tmux_backend.resize_pane(our_sid, cols, rows)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        out_task.cancel()
+        try:
+            await out_task
+        except Exception:
+            pass
 
 
 class AckBody(BaseModel):
@@ -1065,14 +1101,69 @@ def api_transcript(session_id: str, limit: int = 60) -> dict:
     }
 
 
+@app.get("/auth")
+def auth(request: Request, t: str = "") -> Response:
+    """Bootstrap endpoint: visit with ?t=<token> to set the auth cookie."""
+    if not t or not secrets.compare_digest(t, AUTH_TOKEN):
+        return HTMLResponse(
+            "<h1>Invalid token</h1>"
+            "<p>Check the token printed by the server on startup "
+            "or read it from <code>~/.claude-instances-ui/token</code>.</p>",
+            status_code=401,
+        )
+    resp = RedirectResponse(url="/", status_code=302)
+    resp.set_cookie(
+        key=COOKIE_NAME,
+        value=AUTH_TOKEN,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 365,
+    )
+    return resp
+
+
 @app.get("/")
-def index() -> FileResponse:
+def index(request: Request) -> Response:
+    if not _is_authenticated(request):
+        return HTMLResponse(
+            """<!doctype html><html><head><meta charset="utf-8">
+<title>Claude Instances — sign in</title>
+<style>
+body{font-family:system-ui;background:#0b0d10;color:#d6d6d6;
+  display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.card{max-width:520px;padding:32px;background:#15181c;border:1px solid #222;
+  border-radius:12px;box-shadow:0 20px 60px -10px rgba(0,0,0,.6)}
+code{background:#0b0d10;padding:2px 6px;border-radius:4px;color:#ffbf69}
+h1{margin:0 0 12px;font-size:18px}
+p{line-height:1.55;color:#a9a9a9}
+</style></head><body><div class="card">
+<h1>Authentication required</h1>
+<p>Copy the token from <code>~/.claude-instances-ui/token</code> and visit
+<code>/auth?t=&lt;token&gt;</code>. The server also printed a ready-to-click URL
+on startup.</p>
+</div></body></html>""",
+            status_code=401,
+        )
     return FileResponse(STATIC_DIR / "index.html")
 
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
+
+
+PUBLIC_PATHS = {"/auth"}
+PUBLIC_PREFIXES = ("/static/", "/ws/")  # /ws/* auths inside the handler
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        path = request.url.path
+        if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
+            return await call_next(request)
+        if path == "/" or _is_authenticated(request):
+            return await call_next(request)
+        return PlainTextResponse("unauthorized", status_code=401)
 
 
 class NoCacheStaticMiddleware(BaseHTTPMiddleware):
@@ -1084,10 +1175,22 @@ class NoCacheStaticMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(NoCacheStaticMiddleware)
+app.add_middleware(AuthMiddleware)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 if __name__ == "__main__":
     import uvicorn
 
+    auth_url = f"{PUBLIC_BASE_URL}/auth?t={AUTH_TOKEN}"
+    print()
+    print("=" * 72)
+    print("  Claude Instances UI")
+    print("=" * 72)
+    print(f"  Dashboard:  {PUBLIC_BASE_URL}")
+    print(f"  Authenticate (first visit): {auth_url}")
+    print(f"  Token file: {TOKEN_FILE}")
+    print(f"  tmux:       {'available' if tmux_backend.tmux_available() else 'NOT INSTALLED — run: brew install tmux'}")
+    print("=" * 72)
+    print()
     uvicorn.run(app, host=HOST, port=PORT)
