@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Instances</title>
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <aside id="sidebar">
+      <div class="brand">
+        <span class="logo"></span>
+        <span>Claude</span>
+      </div>
+      <nav>
+        <button class="nav" data-filter="all"><span class="dot"></span>All<span class="count" data-count="all"></span></button>
+        <button class="nav" data-filter="needs_input"><span class="dot needs_input"></span>Needs input<span class="count" data-count="needs_input"></span></button>
+        <button class="nav" data-filter="running"><span class="dot running"></span>Running<span class="count" data-count="running"></span></button>
+        <button class="nav" data-filter="idle"><span class="dot idle"></span>Idle<span class="count" data-count="idle"></span></button>
+        <button class="nav" data-filter="ended"><span class="dot ended"></span>Ended<span class="count" data-count="ended"></span></button>
+      </nav>
+      <div class="group-list-wrap">
+        <div class="section-label">
+          <span>Groups</span>
+          <button id="newGroupBtn" title="Create group">＋</button>
+        </div>
+        <div id="groupNav"></div>
+      </div>
+      <div class="foot">
+        <label class="chk"><input type="checkbox" id="showEnded" />Show ended</label>
+        <span id="updated">—</span>
+      </div>
+    </aside>
+
+    <section id="listCol">
+      <header class="col-head">
+        <div class="search-wrap">
+          <input id="search" placeholder="Search…" />
+          <kbd>/</kbd>
+        </div>
+        <button id="openFullBtn" title="Open full dashboard in browser">⤢</button>
+      </header>
+      <div id="list"></div>
+    </section>
+
+    <section id="previewCol">
+      <div id="preview">
+        <div class="empty">
+          <div class="empty-cursor">█</div>
+          <h3>No instance selected</h3>
+          <p>Pick one on the left to see its terminal.</p>
+        </div>
+      </div>
+    </section>
+
+    <template id="listCardTpl">
+      <button class="list-card" data-sid="">
+        <span class="lc-stripe"></span>
+        <span class="lc-sprite"></span>
+        <div class="lc-body">
+          <div class="lc-status-row">
+            <span class="lc-status-glyph"></span>
+            <span class="lc-status-text"></span>
+            <span class="lc-status-time"></span>
+          </div>
+          <div class="lc-name"></div>
+          <div class="lc-cwd"></div>
+          <div class="lc-notif"></div>
+          <div class="lc-meta"></div>
+        </div>
+      </button>
+    </template>
+
+    <template id="previewTpl">
+      <div class="preview-root">
+        <header class="term-header">
+          <div class="term-dots"></div>
+          <div class="term-title">
+            <span class="term-title-sprite"></span>
+            <span class="term-title-name"></span>
+            <span class="term-title-status"></span>
+          </div>
+          <div class="term-actions">
+            <button class="term-btn ph-focus" title="Jump to terminal">⤴</button>
+            <button class="term-btn ph-rename" title="Rename">✎</button>
+            <button class="term-btn ph-group" title="Set group">▦</button>
+            <div class="menu-wrap">
+              <button class="term-btn ph-more" title="More">⋯</button>
+              <div class="menu">
+                <button data-act="sigint">Send SIGINT</button>
+                <button data-act="sigterm" class="danger">Send SIGTERM</button>
+                <button data-act="forget">Forget state</button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <div class="meta-strip">
+          <span class="chip ph-cwd"></span>
+          <span class="chip ph-pid"></span>
+          <span class="chip ph-group-chip"></span>
+          <span class="chip ph-mcp-chip"></span>
+          <span class="chip ph-sid"></span>
+        </div>
+
+        <div class="subagent-strip"></div>
+        <div class="notif-banner"></div>
+
+        <div class="summary-strip">
+          <div class="summary-paragraph">
+            <span class="summary-para-text"></span>
+          </div>
+        </div>
+
+        <div class="term-body" id="termBody">
+          <div class="term-prompt"><span class="tp-path"></span><span class="tp-cmd">claude</span></div>
+          <div class="term-log" id="termLog"></div>
+          <div class="term-footer">
+            <span class="term-footer-status"></span>
+            <span class="scroll-pin" id="scrollPin">↓ live</span>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <div id="toast"></div>
+    <script src="/static/sprite.js?v=13"></script>
+    <script src="/static/app.js?v=13"></script>
+  </body>
+</html>
