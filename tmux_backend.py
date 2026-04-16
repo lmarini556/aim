@@ -1,9 +1,10 @@
 """tmux-backed session lifecycle + I/O.
 
 Uses a dedicated tmux socket (`-L ciu`) so our sessions never collide with a
-user's own tmux server. Sessions are named `ciu-<ulid>`. Output is streamed
-via `tmux pipe-pane` into a per-session FIFO; input is injected via
-`tmux send-keys -H <hex>`.
+user's own tmux server. Sessions are named `ciu-<ulid>`. WebSocket terminals
+attach via a real pty (`pty_attach`) for bidirectional I/O — the same
+architecture used by ttyd, wetty, and gotty. Legacy pipe-pane / send-keys
+helpers are retained for non-interactive callers.
 
 The module is import-safe even when tmux isn't installed — `tmux_available()`
 returns False and callers are expected to degrade gracefully.
@@ -11,11 +12,15 @@ returns False and callers are expected to degrade gracefully.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import pathlib
+import pty as pty_mod
 import secrets
 import shutil
+import struct
 import subprocess
+import termios
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -116,6 +121,13 @@ def spawn(cwd: str, command: str = "claude", extra_env: dict[str, str] | None = 
     if extra_env:
         env.update(extra_env)
     # -d: detached; -s: session name; -c: cwd; quoted command as final arg
+    # Pass env explicitly via `-e` so the var reaches the pane's child even
+    # when the tmux server was already running (attaching to an existing
+    # server ignores the caller's env for new sessions).
+    env_args: list[str] = ["-e", f"CLAUDE_INSTANCES_UI_OWNED={our_sid}"]
+    if extra_env:
+        for k, v in extra_env.items():
+            env_args += ["-e", f"{k}={v}"]
     res = subprocess.run(
         [
             TMUX_BIN, "-L", SOCKET_NAME,
@@ -125,6 +137,7 @@ def spawn(cwd: str, command: str = "claude", extra_env: dict[str, str] | None = 
             "-c", cwd,
             "-x", "200",
             "-y", "50",
+            *env_args,
             command,
         ],
         capture_output=True,
@@ -135,12 +148,65 @@ def spawn(cwd: str, command: str = "claude", extra_env: dict[str, str] | None = 
         raise RuntimeError(f"tmux new-session failed: {res.stderr.strip()}")
     # Decouple pane size from attached clients so resize-window takes effect
     _tmux("set-option", "-t", name, "window-size", "manual")
-    _start_pipe(name, our_sid)
+    # Enable mouse so scroll wheel enters copy-mode for scrollback
+    _tmux("set-option", "-t", name, "mouse", "on")
+    # Generous scrollback for long Claude conversations
+    _tmux("set-option", "-t", name, "history-limit", "50000")
     return our_sid
 
 
+def pty_attach(our_sid: str, cols: int = 80, rows: int = 24) -> tuple[int, subprocess.Popen]:
+    """Attach to a tmux session via a real pty pair.
+
+    Returns ``(master_fd, process)``. The caller owns the fd and must close it
+    when done; closing the master fd causes ``tmux attach`` to exit cleanly
+    (the session itself keeps running).
+
+    This is the same architecture used by ttyd/wetty/gotty: a pty master fd
+    provides bidirectional bytes I/O with the terminal — no pipe-pane, no
+    send-keys, no FIFO.
+    """
+    if not TMUX_BIN:
+        raise RuntimeError("tmux not installed")
+    name = _session_name(our_sid)
+    master_fd, slave_fd = pty_mod.openpty()
+    # Set initial pty size before attach so tmux sees the right geometry
+    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+    env = os.environ.copy()
+    env["TERM"] = "xterm-256color"
+    proc = subprocess.Popen(
+        [TMUX_BIN, "-L", SOCKET_NAME, "attach-session", "-t", name],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        preexec_fn=os.setsid,
+    )
+    os.close(slave_fd)
+    # Non-blocking so asyncio can poll the fd
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    return master_fd, proc
+
+
+def pty_resize(master_fd: int, cols: int, rows: int) -> None:
+    """Update the pty dimensions. tmux sees the SIGWINCH and resizes."""
+    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+
+
 def _start_pipe(session_name: str, our_sid: str) -> None:
-    """Ensure a FIFO exists and pipe-pane writes to it."""
+    """Ensure a FIFO exists and pipe-pane writes to it.
+
+    Each call unconditionally replaces the pipe. `pipe-pane` without
+    `-o` kills any prior `cat` process and starts a fresh one writing
+    to our newly-mkfifo'd path. Using `-o` (toggle) is wrong here:
+    on WS reconnect the prior cat still has an fd to the now-unlinked
+    fifo and keeps writing into a dangling inode, while the new fifo
+    has no writer — xterm's grid silently drifts away from tmux's as
+    emit bytes are lost to the void.
+    """
     fifo = _fifo_path(our_sid)
     try:
         if fifo.exists():
@@ -150,9 +216,7 @@ def _start_pipe(session_name: str, our_sid: str) -> None:
         pass
     _tmux(
         "pipe-pane",
-        "-o",  # toggle; -o forces open (new pipe replaces any prior)
-        "-t",
-        session_name,
+        "-t", session_name,
         f"cat > {fifo}",
     )
 
@@ -215,20 +279,69 @@ def send_signal(our_sid: str, sig: str = "INT") -> None:
 
 
 def capture_pane(our_sid: str, lines: int = 2000) -> bytes:
-    """Return the scrollback + current screen as escape-preserving bytes."""
+    """Return the currently visible pane content as escape-preserving bytes.
+
+    Intentionally does NOT include scrollback — capturing scrollback after a
+    resize returns stacked renders (Claude draws its TUI before SIGWINCH, then
+    again after), which paints as duplicated content in xterm. The live FIFO
+    stream picks up from the current frame forward.
+
+    `lines` is retained for API compatibility but currently unused; pass it if
+    you later want scrollback (use `-S -{lines}`).
+    """
     if not tmux_available():
         return b""
     res = _tmux(
         "capture-pane",
         "-p",       # print to stdout
         "-e",       # include escape sequences
-        "-J",       # join wrapped lines... actually want to preserve visible wrap
-        "-S", f"-{lines}",
         "-t", _session_name(our_sid),
     )
     if res.returncode != 0:
         return b""
     return res.stdout.encode("utf-8", errors="replace")
+
+
+def cursor_position(our_sid: str) -> tuple[int, int] | None:
+    """Return (x, y) cursor position in tmux's virtual grid, or None.
+
+    `capture_pane` dumps grid cells only — no CUP — so after writing a
+    snapshot into xterm the cursor lands wherever the last byte fell
+    (typically the bottom of the pane after trailing \\n's). Callers
+    should emit `\\e[y+1;x+1H` after the snapshot to reposition.
+    """
+    if not tmux_available():
+        return None
+    res = _tmux(
+        "display-message",
+        "-p",
+        "-t", _session_name(our_sid),
+        "#{cursor_x}|#{cursor_y}",
+    )
+    if res.returncode != 0:
+        return None
+    parts = res.stdout.strip().split("|")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def close_pipe(our_sid: str) -> None:
+    """Close any active pipe-pane on the session.
+
+    Calling `pipe-pane` with no command shuts down the existing cat
+    process and lets tmux drain its internal pipe buffer to /dev/null.
+    Any bytes Claude emitted since the last snapshot are lost, but
+    we're about to capture a fresh snapshot anyway — so this is
+    exactly what we want. A subsequent `_start_pipe` call then creates
+    a genuinely fresh pipe with no stale byte prefix.
+    """
+    if not tmux_available():
+        return
+    _tmux("pipe-pane", "-t", _session_name(our_sid))
 
 
 def send_bytes(our_sid: str, data: bytes) -> None:
@@ -244,6 +357,22 @@ def send_bytes(our_sid: str, data: bytes) -> None:
             [TMUX_BIN, "-L", SOCKET_NAME, "send-keys", "-t", _session_name(our_sid), "-H", *hex_pairs],
             capture_output=True,
         )
+
+
+def send_enter(our_sid: str) -> None:
+    """Send a discrete Enter key event, distinct from a raw \\r byte.
+
+    Claude's TUI uses paste-vs-typing detection: a \\r arriving in the same
+    read buffer as the prompt text is treated as a newline inside a paste,
+    not as submit. Using tmux's named key and a small delay ensures the
+    Enter lands as its own keystroke event after the text has been absorbed.
+    """
+    if not tmux_available():
+        return
+    subprocess.run(
+        [TMUX_BIN, "-L", SOCKET_NAME, "send-keys", "-t", _session_name(our_sid), "Enter"],
+        capture_output=True,
+    )
 
 
 def resize_pane(our_sid: str, cols: int, rows: int) -> None:

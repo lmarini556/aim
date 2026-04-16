@@ -3,26 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Claude Instances</title>
+    <title>AIM — Agent Instances Manager</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23ff6b1a'/><text x='32' y='43' text-anchor='middle' font-family='monospace' font-size='28' font-weight='900' fill='%23000'>AIM</text></svg>" />
     <link rel="preconnect" href="https://rsms.me/" />
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <link rel="stylesheet" href="/static/style.css?v=70" />
   </head>
   <body>
     <aside id="sidebar">
       <div class="brand">
-        <span class="logo"></span>
-        <span>Claude</span>
+        <span class="brand-name">A<span class="brand-dot">·</span>I<span class="brand-dot">·</span>M</span>
+        <button id="sidebarToggle" class="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">‹</button>
       </div>
-      <button id="newInstanceBtn" class="new-instance-btn" title="New Claude instance (tmux)">＋  New instance</button>
-      <nav>
-        <button class="nav" data-filter="all"><span class="dot"></span>All<span class="count" data-count="all"></span></button>
-        <button class="nav" data-filter="needs_input"><span class="dot needs_input"></span>Needs input<span class="count" data-count="needs_input"></span></button>
-        <button class="nav" data-filter="running"><span class="dot running"></span>Running<span class="count" data-count="running"></span></button>
-        <button class="nav" data-filter="idle"><span class="dot idle"></span>Idle<span class="count" data-count="idle"></span></button>
-        <button class="nav" data-filter="ended"><span class="dot ended"></span>Ended<span class="count" data-count="ended"></span></button>
-      </nav>
       <div class="group-list-wrap">
         <div class="section-label">
           <span>Groups</span>
@@ -30,17 +23,47 @@
         </div>
         <div id="groupNav"></div>
       </div>
+      <div class="config-section">
+        <div class="section-label"><span>Configuration</span></div>
+        <button class="config-nav" data-config="mcp" title="MCP server configurations">
+          <span class="config-icon">⚙</span>
+          <span class="config-nav-label">MCP Servers</span>
+        </button>
+        <button class="config-nav" data-config="skills" title="Custom slash commands">
+          <span class="config-icon">⌘</span>
+          <span class="config-nav-label">Skills</span>
+        </button>
+        <button class="config-nav" data-config="claudemd" title="CLAUDE.md instructions">
+          <span class="config-icon">📋</span>
+          <span class="config-nav-label">CLAUDE.md</span>
+        </button>
+      </div>
       <div class="foot">
-        <label class="chk"><input type="checkbox" id="showEnded" />Show ended</label>
         <span id="updated">—</span>
       </div>
     </aside>
 
     <section id="listCol">
       <header class="col-head">
+        <button id="newInstanceBtn" class="list-new-btn" title="New instance">＋</button>
         <div class="search-wrap">
           <input id="search" placeholder="Search…" />
           <kbd>/</kbd>
+        </div>
+        <div class="filter-wrap">
+          <button id="filterBtn" class="filter-btn" title="Filter by status">
+            <span class="filter-dot"></span>
+            <span class="filter-label">All</span>
+          </button>
+          <div class="filter-menu" id="filterMenu">
+            <button data-filter="all"><span class="dot"></span>All</button>
+            <button data-filter="needs_input"><span class="dot needs_input"></span>Needs input</button>
+            <button data-filter="running"><span class="dot running"></span>Running</button>
+            <button data-filter="idle"><span class="dot idle"></span>Idle</button>
+            <button data-filter="ended"><span class="dot ended"></span>Ended</button>
+            <hr />
+            <label class="filter-chk"><input type="checkbox" id="showEnded" />Show ended</label>
+          </div>
         </div>
         <button id="openFullBtn" title="Open full dashboard in browser">⤢</button>
       </header>
@@ -85,15 +108,14 @@
             <span class="term-title-status"></span>
           </div>
           <div class="term-actions">
-            <button class="term-btn ph-focus" title="Focus terminal">⌨</button>
-            <button class="term-btn ph-rename" title="Rename">✎</button>
-            <button class="term-btn ph-group" title="Set group">▦</button>
+            <button class="term-btn-text ph-edit" title="Edit name, group, cwd, MCPs">Edit</button>
+            <button class="term-btn-text ph-open-term" title="Open in native terminal">Terminal</button>
+            <button class="term-btn-text ph-stop danger" title="Stop this instance">Stop</button>
             <div class="menu-wrap">
               <button class="term-btn ph-more" title="More">⋯</button>
               <div class="menu">
+                <button data-act="focus">Focus terminal</button>
                 <button data-act="sigint">Send SIGINT (Ctrl-C)</button>
-                <button data-act="sigterm" class="danger">Send SIGTERM</button>
-                <button data-act="kill" class="danger">Kill tmux session</button>
                 <button data-act="forget">Forget state</button>
               </div>
             </div>
@@ -109,23 +131,43 @@
         </div>
 
         <div class="subagent-strip"></div>
-        <div class="notif-banner"></div>
 
         <div class="summary-strip">
+          <div class="summary-label">Summary</div>
           <div class="summary-paragraph">
             <span class="summary-para-text"></span>
           </div>
         </div>
 
-        <div class="term-xterm" id="xtermHost"></div>
-
         <div class="term-body" id="termBody">
-          <div class="term-prompt"><span class="tp-path"></span><span class="tp-cmd">claude</span></div>
-          <div class="term-log" id="termLog"></div>
-          <div class="term-footer">
-            <span class="term-footer-status"></span>
-            <span class="scroll-pin" id="scrollPin">↓ live</span>
+          <div class="xterm-host" id="xtermHost"></div>
+        </div>
+
+        <div class="notif-banner"></div>
+      </div>
+    </template>
+
+    <template id="configEditorTpl">
+      <div class="config-editor-root">
+        <header class="config-editor-head">
+          <div class="config-editor-title">
+            <span class="config-editor-icon">⚙</span>
+            <span class="config-editor-path"></span>
           </div>
+          <div class="config-editor-actions">
+            <button class="term-btn-text ce-save" title="Save changes">Save</button>
+            <button class="term-btn-text ce-close" title="Close editor">Close</button>
+          </div>
+        </header>
+        <div class="config-editor-sidebar">
+          <div class="ce-file-list"></div>
+          <button class="ce-new-btn">＋ New</button>
+        </div>
+        <div class="config-editor-body">
+          <textarea class="ce-textarea" spellcheck="false"></textarea>
+        </div>
+        <div class="config-editor-status">
+          <span class="ce-status-text">Ready</span>
         </div>
       </div>
     </template>
@@ -135,10 +177,19 @@
         <div class="modal-card">
           <h2>New Claude instance</h2>
           <p class="modal-sub">Spawns a <code>claude</code> session inside tmux. It will appear in the list as soon as the first hook fires.</p>
+          <label class="modal-label">Name (optional)</label>
+          <input class="modal-input name-input" placeholder="e.g. Grafana work" autofocus />
           <label class="modal-label">Working directory</label>
-          <input class="modal-input cwd-input" placeholder="/path/to/project" list="recentCwdsList" autofocus />
+          <input class="modal-input cwd-input" placeholder="/path/to/project" list="recentCwdsList" />
           <datalist id="recentCwdsList"></datalist>
           <div class="recent-cwds"></div>
+          <label class="modal-label">MCP source (path to mcp.json)</label>
+          <input class="modal-input mcp-source-input" placeholder="~/.claude.json" spellcheck="false" />
+          <div class="mcp-source-pills"></div>
+          <label class="modal-label">MCPs</label>
+          <div class="mcp-picker">
+            <div class="mcp-picker-empty">Set a source path above</div>
+          </div>
           <label class="modal-label">Command</label>
           <input class="modal-input cmd-input" value="claude" />
           <div class="modal-actions">
@@ -150,9 +201,12 @@
     </template>
 
     <div id="toast"></div>
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-    <script src="/static/sprite.js?v=14"></script>
-    <script src="/static/app.js?v=14"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-canvas@0.5.0/lib/xterm-addon-canvas.min.js"></script>
+    <script src="/static/sprite.js?v=57"></script>
+    <script src="/static/app.js?v=71"></script>
   </body>
 </html>

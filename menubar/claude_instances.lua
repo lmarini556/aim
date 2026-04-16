@@ -25,14 +25,21 @@ end
 local AUTH_TOKEN = loadToken()
 local AUTH_HEADERS = AUTH_TOKEN ~= "" and { Authorization = "Bearer " .. AUTH_TOKEN } or nil
 
-local DASHBOARD_URL = BASE_URL .. "/?compact=1"
--- Dashboard popover can't set the cookie itself; pass the token via query so
--- the /auth redirect sets the cookie before loading the compact page.
-if AUTH_TOKEN ~= "" then
-  DASHBOARD_URL = BASE_URL .. "/auth?t=" .. AUTH_TOKEN
+-- WKWebView inside hs.webview does not reliably persist cookies across the
+-- /auth → / redirect boundary, so we ship the token straight on the index
+-- query string. server.py recognises `?t=<token>` on `/` and sets the cookie
+-- inline before serving the SPA.
+local function buildDashboardUrl()
+  local token = loadToken()
+  if token ~= "" then
+    return BASE_URL .. "/?compact=1&t=" .. token
+  end
+  return BASE_URL .. "/?compact=1"
 end
+
+local DASHBOARD_URL = buildDashboardUrl()
 local API_URL = BASE_URL .. "/api/instances"
-local POLL_SECONDS = 4
+local POLL_SECONDS = 2
 local FRESH_WINDOW = 300
 local TRAY_WIDTH = 460
 local SLIDE_MS = 180
@@ -50,6 +57,17 @@ local clickWatcher = nil
 local escHotkey = nil
 local slideTimer = nil
 local closing = false
+local lastServerStart = nil
+
+-- Sets of sids currently driving the menu icon. Detecting NEW entries here is
+-- exactly the cue that flips the menu bar glyph to ⚠ / ✦ — whenever that
+-- happens for a previously-unseen sid, fire a banner.
+local prevFresh = {}
+local prevNeeds = {}
+local notifyInitialized = false
+local pollOnce       -- forward declaration
+local renderMenubar  -- forward declaration
+local ackSid         -- forward declaration
 
 local function readFile(path)
   local f = io.open(path, "r")
@@ -84,19 +102,268 @@ local function freshIntensity(inst, now)
   if inst.last_event ~= "Stop" then return 0 end
   local ts = inst.hook_timestamp or 0
   if ts == 0 then return 0 end
-  if (acks[inst.session_id] or 0) >= ts then return 0 end
+  local localAck = acks[inst.session_id] or 0
+  local serverAck = inst.ack_timestamp or 0
+  if math.max(localAck, serverAck) >= ts then return 0 end
   local age = now - ts
   if age <= 0 then return 1 end
   if age >= FRESH_WINDOW then return 0 end
   return 1 - age / FRESH_WINDOW
 end
 
-local function notify(title, body)
-  hs.notify.new({
-    title = title,
-    informativeText = body,
-    soundName = hs.notify.defaultNotificationSound,
-  }):send()
+-- ============================================================
+-- Themed banner notifications (hs.canvas) — match card styling
+-- ============================================================
+local BANNER_W = 380
+local BANNER_H = 108
+local BANNER_GAP = 10
+local BANNER_TTL = 30
+local activeBanners = {}
+
+local function reflowBanners()
+  local screen = hs.screen.mainScreen()
+  if not screen then return end
+  local sf = screen:frame()
+  for i, c in ipairs(activeBanners) do
+    c.canvas:topLeft({
+      x = sf.x + sf.w - BANNER_W - 16,
+      y = sf.y + 16 + (BANNER_H + BANNER_GAP) * (i - 1),
+    })
+  end
+end
+
+local function dismissBanner(entry)
+  if entry._dismissing then return end
+  entry._dismissing = true
+  for i, e in ipairs(activeBanners) do
+    if e == entry then table.remove(activeBanners, i) break end
+  end
+  if entry.timer then entry.timer:stop() end
+  entry.canvas:hide(0.2)
+  hs.timer.doAfter(0.24, function()
+    if entry.canvas then entry.canvas:delete() end
+  end)
+  reflowBanners()
+end
+
+local function truncCwd(cwd)
+  if not cwd or cwd == "" then return "" end
+  local home = os.getenv("HOME") or ""
+  if home ~= "" and cwd:sub(1, #home) == home then
+    cwd = "~" .. cwd:sub(#home + 1)
+  end
+  return cwd
+end
+
+local function themedBanner(kind, info, sid)
+  local screen = hs.screen.mainScreen()
+  if not screen then return end
+  local sf = screen:frame()
+  local idx = #activeBanners
+  local x = sf.x + sf.w - BANNER_W - 16
+  local y = sf.y + 16 + (BANNER_H + BANNER_GAP) * idx
+
+  local title = info.name or (sid and sid:sub(1, 8)) or "Instance"
+  local cwd = truncCwd(info.cwd or "")
+  local mcpCount = info.mcp_count or 0
+  local pid = info.pid
+  local toolName = info.last_tool or ""
+  local notifMsg = info.notification_message or ""
+
+  -- Palette
+  local muted = { red = 140/255, green = 140/255, blue = 140/255, alpha = 1 }
+  local mutedStrong = { red = 180/255, green = 180/255, blue = 180/255, alpha = 1 }
+  local surface = { red = 14/255, green = 14/255, blue = 14/255, alpha = 0.97 }
+  local borderBase = { red = 34/255, green = 34/255, blue = 34/255, alpha = 1 }
+
+  local accentColor, glowColor, statusText, statusGlyph
+  if kind == "needs_input" then
+    accentColor = { red = 1.0, green = 143/255, blue = 63/255, alpha = 1 }
+    glowColor = { red = 1.0, green = 107/255, blue = 26/255, alpha = 0.2 }
+    statusGlyph = "!"
+    statusText = "NEEDS INPUT"
+    if toolName ~= "" then statusText = statusText .. " · " .. toolName end
+  else
+    accentColor = { red = 34/255, green = 197/255, blue = 94/255, alpha = 1 }
+    glowColor = { red = 34/255, green = 197/255, blue = 94/255, alpha = 0.2 }
+    statusGlyph = "●"
+    statusText = "IDLE · REPLY"
+  end
+
+  local borderColor = { red = accentColor.red, green = accentColor.green, blue = accentColor.blue, alpha = 0.5 }
+
+  local canvas = hs.canvas.new({ x = x, y = y, w = BANNER_W, h = BANNER_H })
+    :level("floating")
+    :behavior({ "canJoinAllSpaces", "stationary" })
+    :clickActivating(false)
+
+  -- Outer glow
+  canvas[#canvas + 1] = {
+    type = "rectangle",
+    action = "fill",
+    fillColor = glowColor,
+    roundedRectRadii = { xRadius = 14, yRadius = 14 },
+    frame = { x = 0, y = 0, w = BANNER_W, h = BANNER_H },
+  }
+  -- Drop shadow
+  canvas[#canvas + 1] = {
+    type = "rectangle",
+    action = "fill",
+    fillColor = { red = 0, green = 0, blue = 0, alpha = 0.5 },
+    roundedRectRadii = { xRadius = 12, yRadius = 12 },
+    frame = { x = 3, y = 5, w = BANNER_W - 6, h = BANNER_H - 6 },
+  }
+  -- Card background
+  canvas[#canvas + 1] = {
+    type = "rectangle",
+    action = "strokeAndFill",
+    fillColor = surface,
+    strokeColor = borderColor,
+    strokeWidth = 1.5,
+    roundedRectRadii = { xRadius = 10, yRadius = 10 },
+    frame = { x = 4, y = 4, w = BANNER_W - 8, h = BANNER_H - 8 },
+  }
+  -- Left accent stripe
+  canvas[#canvas + 1] = {
+    type = "rectangle",
+    action = "fill",
+    fillColor = accentColor,
+    roundedRectRadii = { xRadius = 2, yRadius = 2 },
+    frame = { x = 4, y = 4, w = 4, h = BANNER_H - 8 },
+  }
+
+  local textX = 16
+  local textW = BANNER_W - textX - 16
+  local curY = 12
+
+  -- Status row
+  canvas[#canvas + 1] = {
+    type = "text",
+    text = hs.styledtext.new(statusGlyph .. "  " .. statusText, {
+      color = accentColor,
+      font = { name = ".SF NS Mono Light Bold", size = 10 },
+    }),
+    frame = { x = textX, y = curY, w = textW, h = 16 },
+  }
+  curY = curY + 18
+
+  -- Instance name
+  canvas[#canvas + 1] = {
+    type = "text",
+    text = hs.styledtext.new(title, {
+      color = { white = 1, alpha = 1 },
+      font = { name = ".SF NS Rounded Bold", size = 14 },
+    }),
+    frame = { x = textX, y = curY, w = textW, h = 20 },
+  }
+  curY = curY + 20
+
+  -- CWD
+  if cwd ~= "" then
+    canvas[#canvas + 1] = {
+      type = "text",
+      text = hs.styledtext.new(cwd, {
+        color = muted,
+        font = { name = ".SF NS Mono Light Regular", size = 11 },
+      }),
+      frame = { x = textX, y = curY, w = textW, h = 16 },
+    }
+    curY = curY + 18
+  end
+
+  -- Notification message (for needs_input)
+  if kind == "needs_input" and notifMsg ~= "" then
+    local truncMsg = #notifMsg > 60 and notifMsg:sub(1, 57) .. "…" or notifMsg
+    canvas[#canvas + 1] = {
+      type = "text",
+      text = hs.styledtext.new(truncMsg, {
+        color = accentColor,
+        font = { name = ".AppleSystemUIFont", size = 11 },
+      }),
+      frame = { x = textX, y = curY, w = textW, h = 16 },
+    }
+    curY = curY + 18
+  end
+
+  -- Tags row
+  local tags = {}
+  if mcpCount > 0 then table.insert(tags, mcpCount .. " MCP" .. (mcpCount == 1 and "" or "s")) end
+  if pid then table.insert(tags, "pid " .. tostring(pid)) end
+  if #tags > 0 then
+    canvas[#canvas + 1] = {
+      type = "text",
+      text = hs.styledtext.new(table.concat(tags, "   "), {
+        color = mutedStrong,
+        font = { name = ".SF NS Mono Light Regular", size = 10 },
+      }),
+      frame = { x = textX, y = curY, w = textW, h = 14 },
+    }
+  end
+
+  local entry = { canvas = canvas, sid = sid }
+  canvas:mouseCallback(function(_, event)
+    if event == "mouseUp" then
+      if sid then
+        ackSid(sid)
+        hs.http.asyncPost(
+          BASE_URL .. "/api/open-dashboard",
+          hs.json.encode({ sid = sid }),
+          (function()
+            local h = { ["Content-Type"] = "application/json" }
+            if AUTH_TOKEN ~= "" then h["Authorization"] = "Bearer " .. AUTH_TOKEN end
+            return h
+          end)(),
+          function() end
+        )
+      end
+      dismissBanner(entry)
+    end
+  end)
+  canvas:canvasMouseEvents(true, true, false, false)
+
+  canvas:show(0.2)
+  entry.timer = hs.timer.doAfter(BANNER_TTL, function() dismissBanner(entry) end)
+  table.insert(activeBanners, entry)
+end
+
+local lastPollData = nil
+
+ackSid = function(sid)
+  if not sid then return end
+  local st = lastStates[sid]
+  local ts = st and st.hook_timestamp or os.time()
+  if (acks[sid] or 0) < ts then
+    acks[sid] = ts
+    saveAcks()
+  end
+  -- Immediately re-render menubar with updated acks so the badge clears
+  if lastPollData then renderMenubar(lastPollData) end
+  -- Push ack to server so the web UI also clears the fresh state
+  hs.http.asyncPost(
+    BASE_URL .. "/api/instances/" .. sid .. "/ack",
+    hs.json.encode({ timestamp = ts }),
+    (function()
+      local h = { ["Content-Type"] = "application/json" }
+      if AUTH_TOKEN ~= "" then h["Authorization"] = "Bearer " .. AUTH_TOKEN end
+      return h
+    end)(),
+    function() pollOnce() end
+  )
+end
+
+local function playChime(kind)
+  local name = (kind == "ready") and "Glass" or "Funk"
+  local s = hs.sound.getByName(name)
+  if s then s:volume(0.5):play() end
+end
+
+local function notify(kind, info, sid)
+  playChime(kind)
+  themedBanner(kind, info, sid)
+end
+
+function M.testNotify()
+  notify("ready", { name = "Test instance", cwd = "~/Documents/test", mcp_count = 2, pid = 12345 }, nil)
 end
 
 local function fetchInstances(callback)
@@ -107,23 +374,29 @@ local function fetchInstances(callback)
   end)
 end
 
-local function diffAndNotify(prev, current)
-  for sid, cur in pairs(current) do
-    local p = prev[sid]
-    if p and p.status ~= cur.status then
-      if cur.status == "needs_input" then
-        local tool = cur.last_tool or ""
-        local msg = "Approval needed"
-        if tool ~= "" then msg = msg .. " for " .. tool end
-        notify(cur.name, msg)
-      elseif p.status == "running" and cur.status == "idle" then
-        notify(cur.name, "Reply ready")
-      end
+-- Fire banners for sids that newly entered the fresh / needs_input buckets.
+local function notifyFromSets(curFresh, curNeeds)
+  if not notifyInitialized then
+    prevFresh = curFresh
+    prevNeeds = curNeeds
+    notifyInitialized = true
+    return
+  end
+  for sid, info in pairs(curNeeds) do
+    if not prevNeeds[sid] then
+      notify("needs_input", info, sid)
     end
   end
+  for sid, info in pairs(curFresh) do
+    if not prevFresh[sid] and not prevNeeds[sid] then
+      notify("ready", info, sid)
+    end
+  end
+  prevFresh = curFresh
+  prevNeeds = curNeeds
 end
 
-local function renderMenubar(data)
+renderMenubar = function(data)
   if not data then
     if menubar then
       menubar:setTitle("⚠")
@@ -131,22 +404,58 @@ local function renderMenubar(data)
     end
     return
   end
+  lastPollData = data
+
+  -- Detect server restart: refresh token + reload webview if open.
+  local curStart = data.server_start
+  if curStart and lastServerStart and curStart ~= lastServerStart then
+    local tok = loadToken()
+    if tok ~= "" then
+      AUTH_TOKEN = tok
+      AUTH_HEADERS = { Authorization = "Bearer " .. tok }
+    end
+    DASHBOARD_URL = buildDashboardUrl()
+    if webview and not closing then
+      webview:url(DASHBOARD_URL .. "&_=" .. tostring(os.time()))
+    end
+    -- no banner for server restart — just refresh silently
+  end
+  lastServerStart = curStart or lastServerStart
 
   local now = os.time()
   local needs, fresh, running, idle = 0, 0, 0, 0
   local current = {}
+  local freshSet = {}
+  local needsSet = {}
   for _, i in ipairs(data.instances or {}) do
     if i.alive then
+      local mcpCount = 0
+      if i.mcps then
+        mcpCount = (i.mcps.global and #i.mcps.global or 0)
+                 + (i.mcps.project and #i.mcps.project or 0)
+                 + (i.mcps.explicit and #i.mcps.explicit or 0)
+      end
+      local instInfo = {
+        name = i.name,
+        cwd = i.cwd,
+        pid = i.pid,
+        last_tool = i.last_tool,
+        mcp_count = mcpCount,
+        notification_message = i.notification_message,
+      }
       current[i.session_id] = {
         status = i.status,
         hook_timestamp = i.hook_timestamp or 0,
+        last_event = i.last_event,
         name = i.name,
         last_tool = i.last_tool,
       }
       if i.status == "needs_input" then
         needs = needs + 1
+        needsSet[i.session_id] = instInfo
       elseif freshIntensity(i, now) > 0 then
         fresh = fresh + 1
+        freshSet[i.session_id] = instInfo
       elseif i.status == "running" then
         running = running + 1
       else
@@ -155,7 +464,7 @@ local function renderMenubar(data)
     end
   end
 
-  diffAndNotify(lastStates, current)
+  notifyFromSets(freshSet, needsSet)
   lastStates = current
 
   local glyph = "◉"
@@ -184,7 +493,7 @@ local function renderMenubar(data)
 
   local styled = hs.styledtext.new(title, {
     color = color,
-    font = { name = "SF Pro Rounded Bold", size = 15 },
+    font = { name = ".SF NS Rounded Bold", size = 15 },
   })
   if menubar then
     menubar:setTitle(styled)
@@ -267,6 +576,14 @@ local function showPopover()
   end
   closing = false
 
+  -- Re-read token in case server regenerated it since Hammerspoon start
+  DASHBOARD_URL = buildDashboardUrl()
+  local tok = loadToken()
+  if tok ~= "" then
+    AUTH_TOKEN = tok
+    AUTH_HEADERS = { Authorization = "Bearer " .. tok }
+  end
+
   local screen = hs.mouse.getCurrentScreen() or hs.screen.mainScreen()
   local frames = trayFrame(screen)
 
@@ -290,7 +607,7 @@ local function showPopover()
       return true
     end)
     :level(hs.drawing.windowLevels.floating)
-    :url(DASHBOARD_URL)
+    :url(DASHBOARD_URL .. "&_=" .. tostring(os.time()))
     :show()
     :bringToFront(true)
 
@@ -317,7 +634,7 @@ local function showPopover()
   escHotkey = hs.hotkey.bind({}, "escape", closePopover)
 end
 
-local function pollOnce()
+pollOnce = function()
   fetchInstances(renderMenubar)
 end
 
@@ -328,7 +645,7 @@ function M.start()
   if menubar then
     menubar:setTitle(hs.styledtext.new("◉", {
       color = { red = 0.95, green = 0.85, blue = 0.62 },
-      font = { name = "SF Pro Rounded Bold", size = 15 },
+      font = { name = ".SF NS Rounded Bold", size = 15 },
     }))
     menubar:setClickCallback(showPopover)
   end
@@ -342,6 +659,11 @@ function M.stop()
   if menubar then menubar:delete(); menubar = nil end
   closePopover()
   if hotkey then hotkey:delete(); hotkey = nil end
+  for _, entry in ipairs(activeBanners) do
+    if entry.timer then entry.timer:stop() end
+    if entry.canvas then entry.canvas:delete() end
+  end
+  activeBanners = {}
 end
 
 M.start()

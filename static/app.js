@@ -1,3 +1,29 @@
+// Visible build stamp — lets us tell at a glance (console + bottom-right
+// chip) whether a refresh actually pulled the latest code. If you don't
+// see "CIU-BUILD-44" in the console AND a small orange "44" chip in the
+// bottom-right corner, the browser is serving cached JS.
+const CIU_BUILD = "CIU-BUILD-65";
+console.log(`[ciu] ${CIU_BUILD} loaded at`, new Date().toISOString());
+(() => {
+  const stamp = document.createElement("div");
+  stamp.id = "ciuBuildStamp";
+  stamp.textContent = CIU_BUILD.replace("CIU-BUILD-", "v");
+  stamp.style.cssText = [
+    "position: fixed",
+    "bottom: 4px",
+    "right: 4px",
+    "z-index: 2147483647",
+    "background: #ff6b1a",
+    "color: #000",
+    "font: 700 10px ui-monospace, SFMono-Regular, Menlo, monospace",
+    "padding: 2px 6px",
+    "border-radius: 3px",
+    "pointer-events: none",
+    "opacity: 0.75",
+  ].join(";");
+  (document.body || document.documentElement).appendChild(stamp);
+})();
+
 const state = {
   filter: "all",
   groupFilter: null,
@@ -6,15 +32,14 @@ const state = {
   instances: [],
   selectedSid: null,
   transcriptData: null,
-  renderedUuids: new Set(),
   renderedSid: null,
-  pinScroll: true,
   lastListSig: "",
+  collapsedGroups: new Set(),
   pendingAcks: {},
-  activeTerm: null, // {terminal, fitAddon, ws, sid, host, resizeHandler}
 };
 
 const FRESH_WINDOW_SECONDS = 300;
+
 
 function acknowledge(sid, hookTs) {
   if (!sid || !hookTs) return;
@@ -42,10 +67,334 @@ function freshIntensity(inst) {
 const $ = (q, el = document) => el.querySelector(q);
 const $$ = (q, el = document) => [...el.querySelectorAll(q)];
 
+// If launched with ?t=<token> (e.g. from the Hammerspoon popover), capture
+// the token and use it as a Bearer header on every API call — WKWebView
+// doesn't reliably retain cookies, so we don't depend on them.
+const AUTH_TOKEN = (() => {
+  try {
+    const fromUrl = new URLSearchParams(location.search).get("t");
+    if (fromUrl) {
+      sessionStorage.setItem("ciu_token", fromUrl);
+      return fromUrl;
+    }
+    return sessionStorage.getItem("ciu_token") || "";
+  } catch {
+    return "";
+  }
+})();
+
+/* -------------------------------------------------------------------- */
+/*  xterm lifecycle — one live Terminal bound to the selected instance   */
+/* -------------------------------------------------------------------- */
+const XTERM_DEBUG = new URLSearchParams(location.search).get("xdebug") === "1";
+const XTERM_DEBUG_MAX_CHUNKS = 40;
+
+// Make the control bytes/escape sequences human-readable so we can spot
+// underlines (ESC[4m), 256-color bg (ESC[48;5;Nm), half-block glyphs (▀ ▄ █),
+// and other suspects that could paint horizontal bars.
+function formatAnsiForLog(bytes) {
+  let s;
+  try {
+    s = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  } catch {
+    s = String(bytes);
+  }
+  return s.replace(/\x1b/g, "\\e").replace(/[\x00-\x1f\x7f]/g, (c) =>
+    c === "\n" ? "\\n\n" :
+    c === "\r" ? "\\r" :
+    c === "\t" ? "\\t" :
+    `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`
+  );
+}
+
+// Pull out just the SGR, cursor-position, and high-interest escape codes
+// from a chunk — far less noise than the full byte dump.
+function summarizeAnsi(bytes) {
+  let s;
+  try { s = new TextDecoder("utf-8", { fatal: false }).decode(bytes); }
+  catch { return ""; }
+  const out = [];
+  // SGR (color/attribute) codes
+  const sgr = s.match(/\x1b\[[\d;]*m/g) || [];
+  for (const c of sgr) {
+    const params = c.slice(2, -1).split(";").filter(Boolean).map(Number);
+    if (!params.length) { out.push("SGR[RESET]"); continue; }
+    const notes = [];
+    for (let i = 0; i < params.length; i++) {
+      const p = params[i];
+      if (p === 0) notes.push("RESET");
+      else if (p === 1) notes.push("BOLD");
+      else if (p === 2) notes.push("DIM");
+      else if (p === 3) notes.push("ITALIC");
+      else if (p === 4) notes.push("*UNDERLINE*");
+      else if (p === 7) notes.push("*INVERSE*");
+      else if (p === 9) notes.push("STRIKE");
+      else if (p === 53) notes.push("*OVERLINE*");
+      else if (p >= 30 && p <= 37) notes.push(`fg${p - 30}`);
+      else if (p >= 40 && p <= 47) notes.push(`*bg${p - 40}*`);
+      else if (p >= 90 && p <= 97) notes.push(`fg${p - 90}+bright`);
+      else if (p >= 100 && p <= 107) notes.push(`*bg${p - 100}+bright*`);
+      else if (p === 38 && params[i + 1] === 5) { notes.push(`fg256:${params[i + 2]}`); i += 2; }
+      else if (p === 48 && params[i + 1] === 5) { notes.push(`*bg256:${params[i + 2]}*`); i += 2; }
+      else if (p === 38 && params[i + 1] === 2) { notes.push(`fgRGB:${params[i + 2]},${params[i + 3]},${params[i + 4]}`); i += 4; }
+      else if (p === 48 && params[i + 1] === 2) { notes.push(`*bgRGB:${params[i + 2]},${params[i + 3]},${params[i + 4]}*`); i += 4; }
+      else notes.push(`p${p}`);
+    }
+    out.push(`SGR[${notes.join(",")}]`);
+  }
+  // Suspect characters that could paint horizontal bars
+  const blocks = s.match(/[▀▄█▁▂▃▅▆▇─━═]/g) || [];
+  if (blocks.length) out.push(`GLYPHS:${[...new Set(blocks)].join("")}×${blocks.length}`);
+  return out.join(" ");
+}
+
+const xtermManager = (() => {
+  // Retro-futuristic palette: deep grey base, orange + white accents.
+  // Full 16-color ANSI override so Claude's chrome and content render
+  // in the branded palette rather than xterm's stock colours.
+  const THEME = {
+    background: "#111111",
+    foreground: "#d8d8d8",
+    cursor: "#ff6b1a",
+    cursorAccent: "#111111",
+    selectionBackground: "rgba(255, 107, 26, 0.25)",
+    black: "#111111",
+    brightBlack: "#3a3a3a",
+    red: "#ff4444",
+    brightRed: "#ff6b6b",
+    green: "#3ddc84",
+    brightGreen: "#7eeca0",
+    yellow: "#ffb347",
+    brightYellow: "#ffd080",
+    blue: "#5b9bf5",
+    brightBlue: "#8cb8ff",
+    magenta: "#bb86fc",
+    brightMagenta: "#d4aaff",
+    cyan: "#4dd0e1",
+    brightCyan: "#80e0ee",
+    white: "#b0b0c0",
+    brightWhite: "#f0f0ff",
+  };
+
+  let term = null;
+  let fit = null;
+  let ws = null;
+  let host = null;
+  let sid = null;
+  let resizeObs = null;
+  let onResizeWin = null;
+  let resizeDebounce = null;
+
+  const wsUrl = (sessionId) => {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const qs = AUTH_TOKEN ? `?t=${encodeURIComponent(AUTH_TOKEN)}` : "";
+    return `${proto}//${location.host}/ws/instances/${sessionId}/terminal${qs}`;
+  };
+
+  const dispose = () => {
+    if (resizeDebounce) {
+      clearTimeout(resizeDebounce);
+      resizeDebounce = null;
+    }
+    if (onResizeWin) {
+      window.removeEventListener("resize", onResizeWin);
+      onResizeWin = null;
+    }
+    if (resizeObs) {
+      try { resizeObs.disconnect(); } catch {}
+      resizeObs = null;
+    }
+    if (ws) {
+      try { ws.close(); } catch {}
+      ws = null;
+    }
+    if (term) {
+      try { term.dispose(); } catch {}
+      term = null;
+    }
+    fit = null;
+    host = null;
+    sid = null;
+  };
+
+  const fitNow = () => {
+    if (!fit || !term) return;
+    try { fit.fit(); } catch {}
+  };
+
+  const sendResize = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !term) return;
+    ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+  };
+
+  const attach = (sessionId, hostEl) => {
+    if (sid === sessionId && term && ws && ws.readyState <= WebSocket.OPEN) return;
+    dispose();
+    if (!hostEl || !window.Terminal) return;
+    sid = sessionId;
+    host = hostEl;
+    host.innerHTML = "";
+    host.classList.add("connecting");
+    host.classList.remove("disconnected");
+
+    term = new window.Terminal({
+      fontFamily: `"SF Mono", Menlo, Monaco, "Cascadia Mono", Consolas, "Liberation Mono", monospace`,
+      fontSize: 13,
+      fontWeight: 400,
+      fontWeightBold: 700,
+      lineHeight: 1.2,
+      letterSpacing: 0,
+      cursorBlink: true,
+      cursorStyle: "block",
+      cursorWidth: 1,
+      allowProposedApi: true,
+      scrollback: 8000,
+      convertEol: false,
+      macOptionIsMeta: true,
+      rightClickSelectsWord: true,
+      drawBoldTextInBrightColors: false,
+      minimumContrastRatio: 1,
+      // customGlyphs: true (xterm default) — lets xterm render box-drawing
+      // chars as pixel-aligned hairlines via its built-in atlas instead of
+      // the font's anti-aliased glyph, which on Retina paints `─` as a
+      // chunky fuzzy bar. These bars are Claude's real turn dividers; we
+      // just need them rendered crisp.
+      theme: THEME,
+    });
+    fit = new window.FitAddon.FitAddon();
+    term.loadAddon(fit);
+    if (window.WebLinksAddon) {
+      try { term.loadAddon(new window.WebLinksAddon.WebLinksAddon()); } catch {}
+    }
+    term.open(host);
+
+    // Pixel-aligned renderer — default DOM renderer smears row backgrounds
+    // across fractional pixels, producing pale horizontal banding between
+    // Claude's `─` divider rows. Try WebGL, fall back to Canvas, else DOM.
+    const pickCtor = (root, name) => {
+      if (!root) return null;
+      if (typeof root === "function") return root;
+      if (root[name] && typeof root[name] === "function") return root[name];
+      return null;
+    };
+    const tryLoadRenderer = () => {
+      const candidates = [
+        { name: "webgl", Ctor: pickCtor(window.WebglAddon, "WebglAddon") },
+        { name: "canvas", Ctor: pickCtor(window.CanvasAddon, "CanvasAddon") },
+      ];
+      for (const c of candidates) {
+        if (!c.Ctor) continue;
+        try {
+          const addon = new c.Ctor();
+          if (typeof addon.onContextLoss === "function") {
+            addon.onContextLoss(() => { try { addon.dispose(); } catch {} });
+          }
+          term.loadAddon(addon);
+          console.log("[xterm] renderer:", c.name);
+          return c.name;
+        } catch (e) {
+          console.warn(`[xterm] ${c.name} renderer failed:`, e);
+        }
+      }
+      console.log("[xterm] renderer: dom (fallback)");
+      return "dom";
+    };
+    tryLoadRenderer();
+
+    // initial fit before we touch the WS so the resize we send is accurate
+    requestAnimationFrame(() => {
+      fitNow();
+      openSocket();
+    });
+
+    // Debounced so a burst of events (browser zoom fires ResizeObserver
+    // several times per Cmd+/- press; each SIGWINCH causes Ink to emit
+    // a full redraw, and back-to-back redraws stack instead of clearing
+    // cleanly) collapses into one final fit + resize.
+    const scheduleResize = () => {
+      if (resizeDebounce) clearTimeout(resizeDebounce);
+      resizeDebounce = setTimeout(() => {
+        resizeDebounce = null;
+        fitNow();
+        sendResize();
+      }, 150);
+    };
+    resizeObs = new ResizeObserver(scheduleResize);
+    resizeObs.observe(host);
+    onResizeWin = scheduleResize;
+    window.addEventListener("resize", onResizeWin);
+
+    term.onData((data) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "input", data }));
+      }
+    });
+    term.onResize(() => sendResize());
+  };
+
+  const openSocket = () => {
+    if (!sid) return;
+    const capturedSid = sid;
+    ws = new WebSocket(wsUrl(sid));
+    ws.binaryType = "arraybuffer";
+    let dbgCount = 0;
+    ws.onopen = () => {
+      if (sid !== capturedSid) return;
+      // Initial handshake: server waits for a resize before streaming so the
+      // snapshot matches the xterm viewport.
+      sendResize();
+      if (host) host.classList.remove("connecting");
+      if (XTERM_DEBUG) {
+        console.log("[xterm rx] WS open — logging first", XTERM_DEBUG_MAX_CHUNKS, "chunks");
+      }
+    };
+    ws.onmessage = (evt) => {
+      if (!term || sid !== capturedSid) return;
+      const data = evt.data instanceof ArrayBuffer ? new Uint8Array(evt.data) : evt.data;
+      if (XTERM_DEBUG && dbgCount < XTERM_DEBUG_MAX_CHUNKS) {
+        dbgCount++;
+        const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+        const summary = summarizeAnsi(bytes);
+        console.groupCollapsed(
+          `[xterm rx #${dbgCount}] ${bytes.byteLength}B — ${summary.slice(0, 180) || "(no SGR/glyphs)"}`
+        );
+        console.log(formatAnsiForLog(bytes));
+        console.groupEnd();
+      }
+      term.write(data);
+    };
+    ws.onclose = () => {
+      if (host && sid === capturedSid) {
+        host.classList.remove("connecting");
+        host.classList.add("disconnected");
+      }
+    };
+    ws.onerror = () => {
+      if (host && sid === capturedSid) {
+        host.classList.remove("connecting");
+        host.classList.add("disconnected");
+      }
+    };
+  };
+
+  const writeText = (text) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "input", data: text }));
+    return true;
+  };
+
+  const focus = () => { if (term) term.focus(); };
+
+  return { attach, detach: dispose, writeText, focus, fit: fitNow, get sid() { return sid; } };
+})();
+
 async function api(method, url, body) {
+  const headers = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (AUTH_TOKEN) headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
   const res = await fetch(url, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : {},
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -118,8 +467,9 @@ function renderListCard(inst) {
   node.addEventListener("click", () => {
     acknowledge(inst.session_id, inst.hook_timestamp);
     if (isCompact()) {
-      // In compact tray mode: open the full dashboard focused on this sid
-      api("POST", "/api/open-dashboard").catch(() => {});
+      // In compact tray mode: focus an existing dashboard tab on this sid,
+      // or open a new one.
+      api("POST", "/api/open-dashboard", { sid: inst.session_id }).catch(() => {});
       window.location.href = "ciu://close";
       return;
     }
@@ -127,12 +477,8 @@ function renderListCard(inst) {
   });
   node.addEventListener("dblclick", (e) => {
     e.preventDefault();
-    // Double-click focuses the terminal (if already selected + tmux-owned)
-    if (state.selectedSid === inst.session_id && state.activeTerm) {
-      try { state.activeTerm.terminal.focus(); } catch {}
-    } else {
-      selectInstance(inst.session_id);
-    }
+    selectInstance(inst.session_id);
+    setTimeout(() => xtermManager.focus(), 250);
   });
   wireDragAndDrop(node, inst.session_id);
   return node;
@@ -141,7 +487,12 @@ function renderListCard(inst) {
 function updateListCard(node, inst) {
   const intensity = freshIntensity(inst);
   const isFresh = intensity > 0;
-  node.className = `list-card ${inst.status}` + (isFresh ? " fresh" : "") + (inst.session_id === state.selectedSid ? " selected" : "");
+  // Toggle only the state-dependent classes so we don't nuke layout classes
+  // (in-group / group-first / group-last / drag-* / merge-*) applied elsewhere.
+  const statuses = ["running", "idle", "needs_input", "ended"];
+  for (const s of statuses) node.classList.toggle(s, inst.status === s);
+  node.classList.toggle("fresh", isFresh);
+  node.classList.toggle("selected", inst.session_id === state.selectedSid);
   node.style.setProperty("--fresh", intensity.toFixed(3));
   const sprite = $(".lc-sprite", node);
   if (sprite && !sprite.dataset.seeded) {
@@ -182,13 +533,14 @@ function updateListCard(node, inst) {
 }
 
 function selectInstance(sid) {
-  if (state.selectedSid === sid) return;
-  unmountTerminal();
+  if (state.selectedSid === sid && !configEditor.mode) return;
+  if (configEditor.mode) configEditor.close();
+  const inst = state.instances.find((i) => i.session_id === sid);
+  if (inst) acknowledge(sid, inst.hook_timestamp);
   state.selectedSid = sid;
   state.transcriptData = null;
-  state.renderedUuids = new Set();
   state.renderedSid = null;
-  state.pinScroll = true;
+  xtermManager.detach();
   renderList();
   $("#preview").innerHTML = `
     <div class="empty">
@@ -226,7 +578,7 @@ function listSignature(items) {
       i.last_tool || "", i.hook_timestamp || 0, i.notification_message || "",
       freshIntensity(i) > 0 ? freshBucket : 0,
     ].join("|"))
-    .join("#") + `§${state.selectedSid || ""}§${state.query}§${state.filter}§${state.groupFilter || ""}§${state.showEnded}`;
+    .join("#") + `§${state.selectedSid || ""}§${state.query}§${state.filter}§${state.groupFilter || ""}§${state.showEnded}§${[...state.collapsedGroups].sort().join(",")}`;
 }
 
 function renderList() {
@@ -263,14 +615,27 @@ function renderList() {
   });
   const needsHeaders = order.length > 1 || order[0] !== "Ungrouped";
   for (const key of order) {
+    const groupItems = buckets.get(key);
+    const collapsed = state.collapsedGroups.has(key);
     if (needsHeaders) {
       const hdr = document.createElement("div");
       hdr.className = "list-group-label";
+      if (collapsed) hdr.classList.add("collapsed");
       hdr.dataset.group = key;
-      hdr.innerHTML = `<span class="lg-name">${escapeHtml(key)}</span><span class="g-count">${buckets.get(key).length}</span>`;
+      const gc = key !== "Ungrouped" ? groupColor(key) : "var(--muted)";
+      hdr.style.setProperty("--group-color", gc);
+      const statusDots = groupItems.map((i) => `<span class="dot ${i.status}"></span>`).join("");
+      hdr.innerHTML = `<span class="lg-chevron">${collapsed ? "▸" : "▾"}</span><span class="lg-name">${escapeHtml(key)}</span><span class="g-count">${groupItems.length}</span>${collapsed ? `<span class="lg-dots">${statusDots}</span>` : ""}`;
+      const chevron = $(".lg-chevron", hdr);
+      if (chevron) chevron.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (state.collapsedGroups.has(key)) state.collapsedGroups.delete(key);
+        else state.collapsedGroups.add(key);
+        state.lastListSig = "";
+        renderList();
+      });
       if (key !== "Ungrouped") {
-        hdr.style.cursor = "text";
-        hdr.title = "Click to rename";
+        hdr.title = "Double-click to rename";
         hdr.addEventListener("dblclick", (e) => {
           e.preventDefault();
           startInlineRename(hdr, key);
@@ -279,98 +644,19 @@ function renderList() {
       }
       list.append(hdr);
     }
-    for (const inst of buckets.get(key)) list.append(renderListCard(inst));
-  }
-}
-
-/* Terminal (xterm.js) */
-function mountTerminal(host, sessionId) {
-  unmountTerminal();
-  if (!window.Terminal) {
-    host.textContent = "xterm.js failed to load (check network)";
-    return;
-  }
-  host.innerHTML = "";
-  const term = new window.Terminal({
-    cursorBlink: true,
-    fontFamily: "ui-monospace, Menlo, Consolas, monospace",
-    fontSize: 13,
-    lineHeight: 1.15,
-    scrollback: 10000,
-    allowProposedApi: true,
-    theme: {
-      background: "#0b0d10",
-      foreground: "#d6d6d6",
-      cursor: "#ffbf69",
-      selectionBackground: "#ffbf6933",
-    },
-  });
-  let fitAddon = null;
-  if (window.FitAddon && window.FitAddon.FitAddon) {
-    fitAddon = new window.FitAddon.FitAddon();
-    term.loadAddon(fitAddon);
-  }
-  term.open(host);
-  if (fitAddon) {
-    try { fitAddon.fit(); } catch {}
-  }
-
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/ws/instances/${sessionId}/terminal`);
-  ws.binaryType = "arraybuffer";
-
-  const sendResize = () => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-  };
-
-  ws.addEventListener("open", () => {
-    if (fitAddon) {
-      try { fitAddon.fit(); } catch {}
+    if (!collapsed) {
+      const grouped = key !== "Ungrouped";
+      groupItems.forEach((inst, idx) => {
+        const card = renderListCard(inst);
+        if (grouped) {
+          card.classList.add("in-group");
+          if (idx === 0) card.classList.add("group-first");
+          if (idx === groupItems.length - 1) card.classList.add("group-last");
+        }
+        list.append(card);
+      });
     }
-    sendResize();
-  });
-  ws.addEventListener("message", (e) => {
-    if (e.data instanceof ArrayBuffer) {
-      term.write(new Uint8Array(e.data));
-    } else {
-      term.write(e.data);
-    }
-  });
-  ws.addEventListener("close", () => {
-    term.write("\r\n\x1b[90m[disconnected]\x1b[0m\r\n");
-  });
-  ws.addEventListener("error", () => {
-    term.write("\r\n\x1b[31m[websocket error]\x1b[0m\r\n");
-  });
-
-  term.onData((data) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "input", data }));
-    }
-  });
-
-  term.onResize(() => sendResize());
-
-  const resizeHandler = () => {
-    if (fitAddon) {
-      try { fitAddon.fit(); } catch {}
-    }
-  };
-  window.addEventListener("resize", resizeHandler);
-
-  state.activeTerm = { terminal: term, fitAddon, ws, sid: sessionId, host, resizeHandler };
-  setTimeout(() => { try { term.focus(); } catch {} }, 30);
-}
-
-function unmountTerminal() {
-  const at = state.activeTerm;
-  if (!at) return;
-  state.activeTerm = null;
-  try { window.removeEventListener("resize", at.resizeHandler); } catch {}
-  try { at.ws.close(); } catch {}
-  try { at.terminal.dispose(); } catch {}
-  if (at.host) at.host.innerHTML = "";
+  }
 }
 
 /* Preview */
@@ -401,21 +687,17 @@ function ensurePreviewShell() {
 
 function renderPreview() {
   if (!state.selectedSid || !state.transcriptData) return;
-  const { session, entries } = state.transcriptData;
+  const { session } = state.transcriptData;
   const shell = ensurePreviewShell();
 
   const sidChanged = state.renderedSid !== session.session_id;
-  const hasTmux = !!session.tmux_session;
-
   if (sidChanged) {
-    state.renderedUuids = new Set();
     state.renderedSid = session.session_id;
-    const log = $("#termLog", shell);
-    if (log) log.innerHTML = "";
-    state.pinScroll = true;
+    const hostEl = $("#xtermHost", shell);
+    if (hostEl) xtermManager.attach(session.session_id, hostEl);
   }
 
-  shell.className = `preview-root ${session.status}` + (hasTmux ? " has-terminal" : "");
+  shell.className = `preview-root ${session.status}`;
   const headSprite = $(".term-title-sprite", shell);
   if (headSprite && headSprite.dataset.sid !== session.session_id) {
     headSprite.innerHTML = window.agentSprite ? window.agentSprite(session.session_id) : "";
@@ -437,49 +719,28 @@ function renderPreview() {
 
   const banner = $(".notif-banner", shell);
   if (session.notification_message && session.status === "needs_input") {
-    banner.textContent = session.notification_message;
     banner.classList.add("show");
+    banner.innerHTML = "";
+    const msg = document.createElement("span");
+    msg.className = "nb-msg";
+    msg.textContent = session.notification_message;
+    banner.append(msg);
   } else {
     banner.classList.remove("show");
+    banner.innerHTML = "";
   }
 
   renderSummary(shell, session.summary);
   renderSubagents(shell, session.subagents || []);
 
-  const focusBtn = $(".ph-focus", shell);
+  // Stop button only enabled for alive sessions
+  const stopBtn = $(".ph-stop", shell);
+  if (stopBtn) stopBtn.disabled = !session.alive;
 
-  // Branch: tmux-owned → xterm.js. Otherwise → read-only transcript view.
-  if (hasTmux) {
-    const host = $("#xtermHost", shell);
-    const needsMount = !state.activeTerm || state.activeTerm.sid !== session.session_id;
-    if (needsMount && host) mountTerminal(host, session.session_id);
-    focusBtn.disabled = false;
-    focusBtn.title = "Focus terminal";
-    return;
+  // Auto-focus the terminal on fresh selection
+  if (sidChanged && session.alive) {
+    setTimeout(() => xtermManager.focus(), 60);
   }
-
-  // External (non-tmux) session path: transcript preview
-  unmountTerminal();
-  focusBtn.disabled = true;
-  focusBtn.title = "External session — no interactive terminal available";
-
-  const tpPath = $(".tp-path", shell);
-  if (tpPath) tpPath.textContent = truncCwd(session.cwd);
-
-  const footerStatus = $(".term-footer-status", shell);
-  if (footerStatus) {
-    if (session.status === "running") {
-      footerStatus.innerHTML = `<span style="color:var(--accent-bright)">▸ running</span>${session.last_tool ? ` · <span style="color:var(--muted-strong)">${escapeHtml(session.last_tool)}</span>` : ""}`;
-    } else if (session.status === "needs_input") {
-      footerStatus.innerHTML = `<span style="color:var(--accent-bright)">! waiting for you</span>`;
-    } else if (session.status === "idle") {
-      footerStatus.innerHTML = `<span style="color:var(--muted-strong)">● idle</span>${session.hook_timestamp ? ` · ${relTime(session.hook_timestamp)} ago` : ""}`;
-    } else {
-      footerStatus.innerHTML = `<span style="color:var(--muted)">× ended</span>`;
-    }
-  }
-
-  renderTermLog(shell, entries);
 }
 
 function renderSubagents(shell, agents) {
@@ -529,197 +790,35 @@ function renderSummary(shell, summary) {
   $(".summary-para-text", strip).textContent = paragraph;
 }
 
-function renderTermLog(shell, entries) {
-  const log = $("#termLog", shell);
-  const wasAtBottom = isAtBottom(log);
-
-  if (!entries.length && !log.childElementCount) {
-    const empty = document.createElement("div");
-    empty.className = "term-empty";
-    empty.textContent = "# no transcript yet";
-    log.append(empty);
-    return;
-  }
-  if (entries.length && log.querySelector(".term-empty")) {
-    log.innerHTML = "";
-  }
-
-  let appended = 0;
-  for (const entry of entries) {
-    const key = entry.uuid || `${entry.timestamp}-${entry.type}`;
-    if (state.renderedUuids.has(key)) continue;
-    state.renderedUuids.add(key);
-    const lines = buildTermLines(entry);
-    for (const line of lines) log.append(line);
-    appended += lines.length;
-  }
-
-  if (appended && (state.pinScroll || wasAtBottom)) {
-    log.classList.add("no-smooth");
-    log.scrollTop = log.scrollHeight;
-    requestAnimationFrame(() => log.classList.remove("no-smooth"));
-  }
-  updateScrollPin(shell);
-}
-
-function buildTermLines(entry) {
-  const lines = [];
-  const ts = fmtTime(entry.timestamp);
-
-  for (const p of entry.parts) {
-    if (p.kind === "text" && (p.text || "").trim()) {
-      lines.push(mkLine(entry.type, ts, p.text));
-    } else if (p.kind === "thinking" && (p.text || "").trim()) {
-      lines.push(mkLine("thinking", ts, p.text, "💭"));
-    } else if (p.kind === "tool_use") {
-      lines.push(mkToolLine(ts, p));
-    } else if (p.kind === "tool_result") {
-      lines.push(mkResultLine(ts, p));
-    }
-  }
-  return lines;
-}
-
-function mkLine(type, ts, text, glyphOverride) {
-  const div = document.createElement("div");
-  div.className = `term-line ${type}`;
-  const glyph = glyphOverride || (type === "user" ? "›" : type === "thinking" ? "≈" : "‹");
-  div.innerHTML = `
-    <span class="tl-time">${ts}</span>
-    <span class="tl-glyph">${glyph}</span>
-    <span class="tl-body"></span>`;
-  $(".tl-body", div).textContent = text;
-  return div;
-}
-
-function mkToolLine(ts, p) {
-  const div = document.createElement("div");
-  div.className = "term-line tool";
-  const summary = summarizeTool(p.tool, p.input);
-  div.innerHTML = `
-    <span class="tl-time">${ts}</span>
-    <span class="tl-glyph">▶</span>
-    <span class="tl-body"></span>`;
-  const body = $(".tl-body", div);
-  const tool = document.createElement("span");
-  tool.className = "tl-tool";
-  tool.textContent = p.tool || "tool";
-  body.append(tool);
-  if (summary) {
-    body.append(" ");
-    const args = document.createElement("span");
-    args.className = "tl-args";
-    args.textContent = summary;
-    body.append(args);
-  }
-  return div;
-}
-
-function mkResultLine(ts, p) {
-  const div = document.createElement("div");
-  div.className = `term-line result${p.is_error ? " error" : ""}`;
-  const text = (p.text || "").trim();
-  const short = text.length > 400;
-  div.innerHTML = `
-    <span class="tl-time">${ts}</span>
-    <span class="tl-glyph">◂</span>
-    <span class="tl-body"></span>`;
-  $(".tl-body", div).textContent = short ? text.slice(0, 400) : text;
-  if (short) {
-    const btn = document.createElement("button");
-    btn.className = "expand-btn";
-    btn.textContent = `[+] show ${text.length - 400} more chars`;
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      div.classList.toggle("expanded");
-      if (div.classList.contains("expanded")) {
-        $(".tl-body", div).textContent = text;
-        btn.textContent = "[−] collapse";
-      } else {
-        $(".tl-body", div).textContent = text.slice(0, 400);
-        btn.textContent = `[+] show ${text.length - 400} more chars`;
-      }
-    });
-    $(".tl-body", div).appendChild(document.createElement("br"));
-    $(".tl-body", div).appendChild(btn);
-  }
-  return div;
-}
-
-function summarizeTool(tool, input) {
-  if (!input) return "";
-  if (tool === "Bash" && input.command) return input.command;
-  if (tool === "Read" && input.file_path) return input.file_path;
-  if (tool === "Edit" && input.file_path) return input.file_path;
-  if (tool === "Write" && input.file_path) return input.file_path;
-  if (tool === "Grep" && input.pattern) return `"${input.pattern}"${input.path ? " in " + input.path : ""}`;
-  if (tool === "Glob" && input.pattern) return input.pattern;
-  if (tool === "WebFetch" && input.url) return input.url;
-  if (tool === "WebSearch" && input.query) return `"${input.query}"`;
-  if (tool === "TodoWrite") return `${(input.todos || []).length} todos`;
-  if (tool === "Task" && input.description) return input.description;
-  try {
-    const s = JSON.stringify(input);
-    return s.length > 200 ? s.slice(0, 200) + "…" : s;
-  } catch {
-    return "";
-  }
-}
-
-function isAtBottom(el) {
-  return Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 30;
-}
-
-function updateScrollPin(shell) {
-  const log = $("#termLog", shell);
-  const pin = $("#scrollPin", shell);
-  if (isAtBottom(log)) {
-    state.pinScroll = true;
-    pin.classList.remove("unpinned");
-    pin.textContent = "↓ live";
-  } else {
-    state.pinScroll = false;
-    pin.classList.add("unpinned");
-    pin.textContent = "↓ jump to live";
-  }
-}
-
 function wirePreviewActions(shell) {
   const sess = () => state.transcriptData?.session;
 
-  const focusBtnWire = $(".ph-focus", shell);
-  focusBtnWire.addEventListener("click", () => {
-    if (state.activeTerm) {
-      try { state.activeTerm.terminal.focus(); } catch {}
+  $(".ph-edit", shell).addEventListener("click", () => {
+    const s = sess(); if (!s) return;
+    showEditModal(s);
+  });
+
+  $(".ph-open-term", shell).addEventListener("click", async () => {
+    const s = sess(); if (!s) return;
+    try {
+      await api("POST", `/api/instances/${s.session_id}/open-terminal`);
+      toast("Opened in terminal");
+    } catch (e) {
+      toast(`Failed: ${e.message}`, { error: true });
     }
   });
 
-  $(".ph-rename", shell).addEventListener("click", () => {
+  $(".ph-stop", shell).addEventListener("click", async () => {
     const s = sess(); if (!s) return;
-    showModal({
-      title: "Rename instance",
-      value: s.custom_name || s.name,
-      placeholder: "e.g. Grafana work",
-      onSubmit: async (v) => {
-        await api("PUT", `/api/instances/${s.session_id}/name`, { name: v });
-        refresh();
-      },
-    });
-  });
-
-  $(".ph-group", shell).addEventListener("click", () => {
-    const s = sess(); if (!s) return;
-    const existing = [...new Set(state.instances.map((i) => i.group).filter(Boolean))];
-    showModal({
-      title: "Set group",
-      value: s.group || "",
-      placeholder: "Group name (blank = ungrouped)",
-      suggestions: existing,
-      onSubmit: async (v) => {
-        await api("PUT", `/api/instances/${s.session_id}/group`, { group: v || null });
-        refresh();
-      },
-    });
+    const label = s.custom_name || s.name;
+    if (!confirm(`Stop "${label}"? This kills the process.`)) return;
+    try {
+      await api("POST", `/api/instances/${s.session_id}/kill`);
+      toast("Stopped");
+      refresh();
+    } catch (e) {
+      toast(`Stop failed: ${e.message}`, { error: true });
+    }
   });
 
   const more = $(".ph-more", shell);
@@ -735,24 +834,13 @@ function wirePreviewActions(shell) {
       menu.classList.remove("open");
       const s = sess(); if (!s) return;
       const act = btn.dataset.act;
-      if (act === "sigint") {
+      if (act === "focus") {
+        xtermManager.focus();
+      } else if (act === "sigint") {
         await api("POST", `/api/instances/${s.session_id}/signal`, { signal: "INT" });
         toast("SIGINT sent");
-      } else if (act === "sigterm") {
-        if (!confirm(`SIGTERM this session?`)) return;
-        await api("POST", `/api/instances/${s.session_id}/signal`, { signal: "TERM" });
-        toast("SIGTERM sent");
-      } else if (act === "kill") {
-        if (!s.tmux_session) {
-          toast("Not a tmux-owned session", { error: true });
-          return;
-        }
-        if (!confirm(`Kill tmux session ${s.tmux_session}?`)) return;
-        await api("POST", `/api/instances/${s.session_id}/kill`);
-        unmountTerminal();
-        toast("Session killed");
-        refresh();
       } else if (act === "forget") {
+        xtermManager.detach();
         await api("DELETE", `/api/instances/${s.session_id}`);
         state.selectedSid = null;
         state.transcriptData = null;
@@ -768,13 +856,12 @@ function wirePreviewActions(shell) {
     })
   );
 
-  const log = $("#termLog", shell);
-  log.addEventListener("scroll", () => updateScrollPin(shell));
-  $("#scrollPin", shell).addEventListener("click", () => {
-    state.pinScroll = true;
-    log.scrollTop = log.scrollHeight;
-    updateScrollPin(shell);
-  });
+  // Clicking the terminal area focuses it — convenience for laptops where
+  // xterm's own focus handling can drop after a DOM reshuffle.
+  const host = $("#xtermHost", shell);
+  if (host) {
+    host.addEventListener("mousedown", () => setTimeout(() => xtermManager.focus(), 0));
+  }
 }
 
 /* Drag and drop — custom pointer-based, works in WKWebView */
@@ -1067,21 +1154,33 @@ function startInlineRename(headerEl, currentName) {
   });
 }
 
-/* Sidebar */
+/* Filter dropdown */
 function renderNav() {
-  const live = state.instances.filter((i) => i.alive);
-  const counts = {
-    all: state.showEnded ? state.instances.length : live.length,
-    running: live.filter((i) => i.status === "running").length,
-    idle: live.filter((i) => i.status === "idle").length,
-    needs_input: live.filter((i) => i.status === "needs_input").length,
-    ended: state.instances.filter((i) => !i.alive).length,
-  };
-  $$(".nav[data-filter]").forEach((btn) => {
-    const f = btn.dataset.filter;
-    btn.classList.toggle("active", state.filter === f && !state.groupFilter);
-    $(".count", btn).textContent = counts[f] ?? "";
+  const filterBtn = $("#filterBtn");
+  const filterMenu = $("#filterMenu");
+  if (!filterBtn || !filterMenu) return;
+  const labels = { all: "All", needs_input: "Needs input", running: "Running", idle: "Idle", ended: "Ended" };
+  $(".filter-label", filterBtn).textContent = labels[state.filter] || "All";
+  filterBtn.classList.toggle("active", state.filter !== "all" || state.groupFilter);
+  const dot = $(".filter-dot", filterBtn);
+  if (dot) {
+    dot.className = "filter-dot";
+    if (state.filter !== "all") dot.classList.add(state.filter);
+  }
+  $$("[data-filter]", filterMenu).forEach((btn) => {
+    btn.classList.toggle("active", state.filter === btn.dataset.filter && !state.groupFilter);
   });
+}
+
+const GROUP_COLORS = [
+  "#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#38d9a9",
+  "#4dabf7", "#748ffc", "#b197fc", "#e599f7", "#f06595",
+  "#ff922b", "#51cf66", "#3bc9db", "#5c7cfa", "#cc5de8",
+];
+function groupColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  return GROUP_COLORS[Math.abs(h) % GROUP_COLORS.length];
 }
 
 function renderGroupNav() {
@@ -1101,19 +1200,20 @@ function renderGroupNav() {
   for (const g of groups) {
     const row = document.createElement("button");
     row.className = "group-nav-item" + (state.groupFilter === g ? " active" : "");
+    const gc = groupColor(g);
     row.innerHTML = `
-      <span class="dot" style="background:var(--accent)"></span>
-      <span class="g-name">${escapeHtml(g)}</span>
+      <span class="dot" style="background:${gc}"></span>
+      <span class="nav-label">${escapeHtml(g)}</span>
       <span class="count">${state.instances.filter((i) => i.group === g).length}</span>
-      <button class="del" title="Delete group">×</button>`;
+      <button class="group-del" title="Delete group">×</button>`;
     row.addEventListener("click", (e) => {
-      if (e.target.closest(".del")) return;
+      if (e.target.closest(".group-del")) return;
       state.groupFilter = state.groupFilter === g ? null : g;
       renderList();
       renderGroupNav();
       renderNav();
     });
-    $(".del", row).addEventListener("click", async (e) => {
+    $(".group-del", row).addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!confirm(`Delete group "${g}"?`)) return;
       const data = await api("GET", "/api/groups");
@@ -1154,6 +1254,161 @@ function showModal({ title, value, placeholder, suggestions, onSubmit }) {
     if (e.key === "Enter") submit();
     if (e.key === "Escape") close();
   });
+}
+
+async function showEditModal(session) {
+  const groups = [...new Set(state.instances.map((i) => i.group).filter(Boolean))];
+  const alive = !!session.alive;
+
+  const bd = document.createElement("div");
+  bd.className = "modal-backdrop edit-modal";
+  bd.innerHTML = `
+    <div class="modal-card">
+      <h2>Edit instance</h2>
+      <p class="modal-sub">Name &amp; group save instantly. Changing <b>directory</b> or <b>MCPs</b> requires a restart.</p>
+
+      <label class="modal-label">Name</label>
+      <input class="modal-input edit-name" placeholder="Display name" />
+
+      <label class="modal-label">Group</label>
+      <input class="modal-input edit-group" list="editGroupList" placeholder="Group (blank = ungrouped)" />
+      <datalist id="editGroupList">${groups.map((g) => `<option value="${escapeHtml(g)}"></option>`).join("")}</datalist>
+
+      <label class="modal-label">Working directory</label>
+      <input class="modal-input edit-cwd" />
+
+      <label class="modal-label">MCP source</label>
+      <input class="modal-input edit-mcp-source" />
+      <div class="edit-mcp-picker mcp-picker">
+        <div class="mcp-picker-empty">Loading…</div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="modal-btn cancel">Close</button>
+        <button class="modal-btn save-only">Save name/group</button>
+        <button class="modal-btn primary restart" ${alive ? "" : "disabled"}>Restart with new config</button>
+      </div>
+    </div>`;
+  document.body.append(bd);
+
+  const nameI = $(".edit-name", bd);
+  const groupI = $(".edit-group", bd);
+  const cwdI = $(".edit-cwd", bd);
+  const srcI = $(".edit-mcp-source", bd);
+  const picker = $(".edit-mcp-picker", bd);
+
+  nameI.value = session.custom_name || session.name || "";
+  groupI.value = session.group || "";
+  cwdI.value = session.cwd || "";
+  const initialSrc = localStorage.getItem("ciu_last_mcp_source") || "~/.claude.json";
+  srcI.value = initialSrc;
+
+  let useMcps = null;
+
+  const renderCheckboxes = (names, currentlyEnabled = null) => {
+    picker.innerHTML = "";
+    if (!names || !names.length) {
+      picker.innerHTML = `<div class="mcp-picker-empty">No MCPs in this file</div>`;
+      useMcps = () => [];
+      return;
+    }
+    for (const name of names) {
+      const row = document.createElement("label");
+      row.className = "mcp-row";
+      const checked = currentlyEnabled ? currentlyEnabled.includes(name) : true;
+      row.innerHTML = `<input type="checkbox" value="${escapeHtml(name)}" ${checked ? "checked" : ""} /><span class="mcp-name">${escapeHtml(name)}</span>`;
+      picker.append(row);
+    }
+    const quick = document.createElement("div");
+    quick.className = "mcp-quick";
+    quick.innerHTML = `<button type="button" data-act="all">all</button><button type="button" data-act="none">none</button>`;
+    picker.append(quick);
+    quick.addEventListener("click", (e) => {
+      const act = e.target.dataset.act;
+      if (!act) return;
+      for (const cb of $$('input[type=checkbox]', picker)) cb.checked = act === "all";
+    });
+    useMcps = () => $$("input[type=checkbox]:checked", picker).map((c) => c.value);
+  };
+
+  const loadMcps = async (path) => {
+    try {
+      const res = await api("POST", "/api/mcp-list", { path });
+      if (!res.exists) {
+        picker.innerHTML = `<div class="mcp-picker-empty">File not found: <code>${escapeHtml(res.path)}</code></div>`;
+        useMcps = () => [];
+        return;
+      }
+      const enabled = [
+        ...(session.mcps?.global || []),
+        ...(session.mcps?.project || []),
+        ...(session.mcps?.explicit || []),
+      ];
+      renderCheckboxes(res.mcps, enabled);
+    } catch (e) {
+      picker.innerHTML = `<div class="mcp-picker-empty">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+  };
+  loadMcps(initialSrc);
+  let srcTimer = null;
+  srcI.addEventListener("input", () => {
+    clearTimeout(srcTimer);
+    srcTimer = setTimeout(() => loadMcps(srcI.value.trim()), 350);
+  });
+
+  const close = () => bd.remove();
+  $(".cancel", bd).addEventListener("click", close);
+  bd.addEventListener("click", (e) => { if (e.target === bd) close(); });
+  bd.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+
+  $(".save-only", bd).addEventListener("click", async () => {
+    try {
+      await api("PUT", `/api/instances/${session.session_id}/name`, { name: nameI.value.trim() });
+      await api("PUT", `/api/instances/${session.session_id}/group`, { group: groupI.value.trim() || null });
+      toast("Saved");
+      close();
+      refresh();
+    } catch (e) {
+      toast(`Save failed: ${e.message}`, { error: true });
+    }
+  });
+
+  const restartBtn = $(".restart", bd);
+  if (restartBtn) {
+    restartBtn.addEventListener("click", async () => {
+      const newCwd = cwdI.value.trim();
+      if (!newCwd) { cwdI.focus(); return; }
+      if (!confirm(`Restart with new config?\nThis kills the current tmux session and spawns a new one in ${newCwd}.\nThe conversation will be resumed via --resume.`)) return;
+      try {
+        await api("PUT", `/api/instances/${session.session_id}/name`, { name: nameI.value.trim() });
+        await api("PUT", `/api/instances/${session.session_id}/group`, { group: groupI.value.trim() || null });
+        const oldSessionId = session.session_id;
+        await api("POST", `/api/instances/${session.session_id}/kill`).catch(() => {});
+        const payload = {
+          cwd: newCwd,
+          command: `claude --resume ${oldSessionId}`,
+          name: nameI.value.trim() || undefined,
+        };
+        if (typeof useMcps === "function") {
+          payload.mcps = useMcps();
+          payload.mcp_source = srcI.value.trim();
+        }
+        const res = await api("POST", "/api/instances/new", payload);
+        close();
+        toast("Restarted (resuming conversation)");
+        const deadline = Date.now() + 5000;
+        const tick = async () => {
+          await refresh();
+          const match = state.instances.find((i) => i.our_sid === res.our_sid);
+          if (match) { selectInstance(match.session_id); return; }
+          if (Date.now() < deadline) setTimeout(tick, 300);
+        };
+        tick();
+      } catch (e) {
+        toast(`Restart failed: ${e.message}`, { error: true });
+      }
+    });
+  }
 }
 
 function promptNewGroup() {
@@ -1213,6 +1468,13 @@ function promptNewGroup() {
 
 /* Refresh */
 let _refreshing = false;
+let _pendingSidFromUrl = (() => {
+  try {
+    return new URLSearchParams(location.search).get("sid") || null;
+  } catch {
+    return null;
+  }
+})();
 async function refresh() {
   if (_refreshing) return;
   _refreshing = true;
@@ -1223,6 +1485,14 @@ async function refresh() {
     renderNav();
     renderGroupNav();
     renderList();
+    // Auto-select an sid passed via the URL (e.g. from the Hammerspoon popover)
+    if (_pendingSidFromUrl) {
+      const match = instances.find((i) => i.session_id === _pendingSidFromUrl);
+      if (match) {
+        selectInstance(match.session_id);
+        _pendingSidFromUrl = null;
+      }
+    }
     if (state.selectedSid) await loadTranscript();
   } catch (e) {
     console.error(e);
@@ -1231,28 +1501,240 @@ async function refresh() {
   }
 }
 
-/* Events */
-$$(".nav[data-filter]").forEach((btn) =>
-  btn.addEventListener("click", () => {
-    state.filter = btn.dataset.filter;
-    state.groupFilter = null;
+/* ====================================================================== */
+/*  Configuration editor                                                  */
+/* ====================================================================== */
+const configEditor = (() => {
+  let mode = null; // "mcp" | "skills" | null
+  let items = [];
+  let activeItem = null;
+  let dirty = false;
+
+  const previewCol = () => $("#previewCol") || $("#preview");
+
+  function open(configMode) {
+    mode = configMode;
+    activeItem = null;
+    dirty = false;
+    $$(".config-nav").forEach((b) => b.classList.toggle("active", b.dataset.config === mode));
+    xtermManager.detach();
+    state.selectedSid = null;
     state.lastListSig = "";
-    renderNav();
-    renderGroupNav();
     renderList();
+    loadFileList();
+  }
+
+  function close() {
+    mode = null;
+    activeItem = null;
+    dirty = false;
+    $$(".config-nav").forEach((b) => b.classList.remove("active"));
+    const root = previewCol();
+    root.innerHTML = `<div id="preview"><div class="empty"><div class="empty-cursor">█</div><h3>No instance selected</h3><p>Pick one on the left or click <b>＋</b> to start one.</p></div></div>`;
+  }
+
+  function renderShell() {
+    const root = previewCol();
+    const tpl = $("#configEditorTpl");
+    root.innerHTML = "";
+    const shell = tpl.content.firstElementChild.cloneNode(true);
+    root.append(shell);
+
+    const icons = { mcp: "⚙", skills: "⌘", claudemd: "📋" };
+    const titles = { mcp: "MCP Servers", skills: "Skills", claudemd: "CLAUDE.md" };
+    $(".config-editor-icon", shell).textContent = icons[mode] || "⚙";
+    $(".config-editor-path", shell).textContent = titles[mode] || mode;
+
+    $(".ce-save", shell).addEventListener("click", save);
+    $(".ce-close", shell).addEventListener("click", close);
+    $(".ce-new-btn", shell).addEventListener("click", createNew);
+    $(".ce-textarea", shell).addEventListener("input", () => {
+      dirty = true;
+      $(".ce-status-text", shell).textContent = "Modified";
+      $(".ce-status-text", shell).className = "ce-status-text";
+    });
+    // Cmd+S to save
+    $(".ce-textarea", shell).addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); }
+    });
+    return shell;
+  }
+
+  async function loadFileList() {
+    const shell = renderShell();
+    const fileList = $(".ce-file-list", shell);
+    try {
+      if (mode === "mcp") {
+        const data = await api("GET", "/api/config/mcp");
+        items = data.configs || [];
+      } else if (mode === "skills") {
+        const data = await api("GET", "/api/config/skills");
+        items = data.skills || [];
+      } else if (mode === "claudemd") {
+        const data = await api("GET", "/api/config/claudemd");
+        items = data.files || [];
+      }
+    } catch (e) {
+      fileList.innerHTML = `<div style="padding:12px;color:var(--danger);font-size:12px">Failed to load: ${e.message}</div>`;
+      return;
+    }
+    fileList.innerHTML = "";
+    for (const item of items) {
+      const btn = document.createElement("button");
+      btn.className = "ce-file-item";
+      const label = mode === "mcp" ? item.label
+        : mode === "claudemd" ? item.label
+        : item.name;
+      const scope = mode === "mcp" ? `${item.servers?.length || 0} srv`
+        : mode === "claudemd" ? (item.scope === "global" ? "global" : "project")
+        : (item.scope === "global" ? "global" : "project");
+      const exists = item.exists !== false;
+      btn.innerHTML = `<span>${escapeHtml(label)}</span>${!exists ? '<span class="ce-scope" style="color:var(--muted)">new</span>' : `<span class="ce-scope">${scope}</span>`}`;
+      if (mode === "skills") {
+        const del = document.createElement("button");
+        del.className = "ce-delete";
+        del.textContent = "×";
+        del.title = "Delete skill";
+        del.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!confirm(`Delete "${item.name}"?`)) return;
+          try {
+            await api("POST", "/api/config/skill/delete", { path: item.path });
+            toast("Deleted");
+            loadFileList();
+          } catch (err) { toast(err.message, { error: true }); }
+        });
+        btn.append(del);
+      }
+      btn.addEventListener("click", () => selectItem(item, btn));
+      fileList.append(btn);
+    }
+    if (items.length && !activeItem) {
+      const firstBtn = $(".ce-file-item", fileList);
+      if (firstBtn) selectItem(items[0], firstBtn);
+    }
+  }
+
+  async function selectItem(item, btnEl) {
+    if (dirty && !confirm("Discard unsaved changes?")) return;
+    activeItem = item;
+    dirty = false;
+    $$(".ce-file-item").forEach((b) => b.classList.remove("active"));
+    if (btnEl) btnEl.classList.add("active");
+
+    const shell = $(".config-editor-root");
+    if (!shell) return;
+    $(".config-editor-path", shell).textContent = item.path || item.name;
+    const textarea = $(".ce-textarea", shell);
+    const statusText = $(".ce-status-text", shell);
+    statusText.textContent = "Loading…";
+    statusText.className = "ce-status-text";
+
+    try {
+      const endpoint = mode === "mcp" ? "/api/config/mcp/read"
+        : mode === "claudemd" ? "/api/config/claudemd/read"
+        : "/api/config/skill/read";
+      const data = await api("POST", endpoint, { path: item.path });
+      textarea.value = data.content || "";
+      statusText.textContent = "Ready";
+    } catch (e) {
+      textarea.value = "";
+      statusText.textContent = `Error: ${e.message}`;
+      statusText.className = "ce-status-text error";
+    }
+  }
+
+  async function save() {
+    if (!activeItem) return;
+    const shell = $(".config-editor-root");
+    if (!shell) return;
+    const textarea = $(".ce-textarea", shell);
+    const statusText = $(".ce-status-text", shell);
+
+    try {
+      const endpoint = mode === "mcp" ? "/api/config/mcp/write"
+        : mode === "claudemd" ? "/api/config/claudemd/write"
+        : "/api/config/skill/write";
+      await api("POST", endpoint, { path: activeItem.path, content: textarea.value });
+      dirty = false;
+      statusText.textContent = "Saved ✓";
+      statusText.className = "ce-status-text saved";
+      setTimeout(() => { if (statusText.textContent === "Saved ✓") statusText.textContent = "Ready"; }, 2000);
+    } catch (e) {
+      statusText.textContent = `Save failed: ${e.message}`;
+      statusText.className = "ce-status-text error";
+    }
+  }
+
+  async function createNew() {
+    const prompts = { mcp: "Path for new MCP config:", skills: "Skill name (e.g. my-skill):", claudemd: "Path for new CLAUDE.md:" };
+    const name = prompt(prompts[mode] || "Name:");
+    if (!name) return;
+    try {
+      if (mode === "mcp") {
+        const p = name.startsWith("/") || name.startsWith("~") ? name : `~/.claude/${name}`;
+        await api("POST", "/api/config/mcp/write", { path: p, content: JSON.stringify({ mcpServers: {} }, null, 2) });
+      } else if (mode === "claudemd") {
+        const p = name.startsWith("/") || name.startsWith("~") ? name : `${name}/CLAUDE.md`;
+        await api("POST", "/api/config/claudemd/write", { path: p, content: "# CLAUDE.md\n\n" });
+      } else {
+        const scope = prompt("Scope — type 'global' or a project path:", "global");
+        if (!scope) return;
+        await api("POST", "/api/config/skill/create", { scope, name });
+      }
+      toast("Created");
+      loadFileList();
+    } catch (e) {
+      toast(`Failed: ${e.message}`, { error: true });
+    }
+  }
+
+  return { open, close, get mode() { return mode; } };
+})();
+
+// Wire sidebar config nav buttons
+$$(".config-nav").forEach((btn) =>
+  btn.addEventListener("click", () => {
+    const m = btn.dataset.config;
+    if (configEditor.mode === m) configEditor.close();
+    else configEditor.open(m);
   })
 );
+
+/* Events — filter dropdown */
+(() => {
+  const filterBtn = $("#filterBtn");
+  const filterMenu = $("#filterMenu");
+  if (!filterBtn || !filterMenu) return;
+  filterBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    filterMenu.classList.toggle("open");
+  });
+  document.addEventListener("click", () => filterMenu.classList.remove("open"));
+  filterMenu.addEventListener("click", (e) => e.stopPropagation());
+  $$("[data-filter]", filterMenu).forEach((btn) =>
+    btn.addEventListener("click", () => {
+      state.filter = btn.dataset.filter;
+      state.groupFilter = null;
+      state.lastListSig = "";
+      filterMenu.classList.remove("open");
+      renderNav();
+      renderGroupNav();
+      renderList();
+    })
+  );
+  const showEndedCb = $("#showEnded");
+  if (showEndedCb) showEndedCb.addEventListener("change", (e) => {
+    state.showEnded = e.target.checked;
+    state.lastListSig = "";
+    renderNav();
+    renderList();
+  });
+})();
 
 $("#search").addEventListener("input", (e) => {
   state.query = e.target.value;
   state.lastListSig = "";
-  renderList();
-});
-
-$("#showEnded").addEventListener("change", (e) => {
-  state.showEnded = e.target.checked;
-  state.lastListSig = "";
-  renderNav();
   renderList();
 });
 
@@ -1266,6 +1748,7 @@ async function showNewInstanceModal() {
   const close = () => bd.remove();
   const cwdInput = $(".cwd-input", bd);
   const cmdInput = $(".cmd-input", bd);
+  const nameInput = $(".name-input", bd);
   const datalist = $("#recentCwdsList", bd);
   const recentBox = $(".recent-cwds", bd);
 
@@ -1290,13 +1773,125 @@ async function showNewInstanceModal() {
     }
   } catch {}
 
+  // MCP source: editable path + quick-pick pills + dynamic checkbox list.
+  const mcpPicker = $(".mcp-picker", bd);
+  const mcpSourceInput = $(".mcp-source-input", bd);
+  const mcpSourcePills = $(".mcp-source-pills", bd);
+  let useMcps = null;
+
+  const renderMcpCheckboxes = (names) => {
+    mcpPicker.innerHTML = "";
+    if (!names || !names.length) {
+      mcpPicker.innerHTML = `<div class="mcp-picker-empty">No MCPs in this file</div>`;
+      useMcps = () => [];
+      return;
+    }
+    const saved = JSON.parse(localStorage.getItem("ciu_last_mcps") || "null");
+    for (const name of names) {
+      const row = document.createElement("label");
+      row.className = "mcp-row";
+      const checked = saved ? saved.includes(name) : true;
+      row.innerHTML = `<input type="checkbox" value="${escapeHtml(name)}" ${checked ? "checked" : ""} /><span class="mcp-name">${escapeHtml(name)}</span>`;
+      mcpPicker.append(row);
+    }
+    const quick = document.createElement("div");
+    quick.className = "mcp-quick";
+    quick.innerHTML = `<button type="button" data-act="all">all</button><button type="button" data-act="none">none</button>`;
+    mcpPicker.append(quick);
+    quick.addEventListener("click", (e) => {
+      const act = e.target.dataset.act;
+      if (!act) return;
+      for (const cb of $$('input[type=checkbox]', mcpPicker)) cb.checked = act === "all";
+    });
+    useMcps = () => $$("input[type=checkbox]:checked", mcpPicker).map((c) => c.value);
+  };
+
+  const loadFromPath = async (path) => {
+    const p = (path || "").trim();
+    if (!p) {
+      mcpPicker.innerHTML = `<div class="mcp-picker-empty">Set a source path above</div>`;
+      useMcps = null;
+      return;
+    }
+    mcpPicker.innerHTML = `<div class="mcp-picker-empty">Loading…</div>`;
+    try {
+      const res = await api("POST", "/api/mcp-list", { path: p });
+      if (!res.exists) {
+        mcpPicker.innerHTML = `<div class="mcp-picker-empty">File not found: <code>${escapeHtml(res.path)}</code></div>`;
+        useMcps = () => [];
+        return;
+      }
+      renderMcpCheckboxes(res.mcps);
+    } catch (e) {
+      mcpPicker.innerHTML = `<div class="mcp-picker-empty">Failed: ${escapeHtml(e.message)}</div>`;
+      useMcps = null;
+    }
+  };
+
+  // Fetch known sources for quick-pick pills (failure is non-fatal)
+  let knownSources = [];
+  try {
+    const { sources } = await api("GET", "/api/mcp-sources");
+    knownSources = sources || [];
+  } catch {}
+
+  mcpSourcePills.innerHTML = "";
+  const pillsToShow = knownSources.length
+    ? knownSources
+    : [
+        { path: "~/.claude.json", label: "~/.claude.json", exists: true, count: null },
+        { path: "~/.claude/mcp.json", label: "~/.claude/mcp.json", exists: true, count: null },
+      ];
+  for (const s of pillsToShow) {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "mcp-source-pill";
+    if (s.exists === false) pill.classList.add("missing");
+    pill.title = s.path;
+    pill.innerHTML = `<span class="mss-label">${escapeHtml(s.label || s.path)}</span>` +
+      (s.count != null ? `<span class="mss-count">${s.count}</span>` : "");
+    pill.addEventListener("click", () => {
+      mcpSourceInput.value = s.path;
+      localStorage.setItem("ciu_last_mcp_source", s.path);
+      loadFromPath(s.path);
+    });
+    mcpSourcePills.append(pill);
+  }
+
+  // Pre-fill the input and load
+  const savedPath = localStorage.getItem("ciu_last_mcp_source") || "";
+  const firstExisting = knownSources.find((s) => s.exists);
+  const initialPath = savedPath || (firstExisting ? firstExisting.path : "~/.claude.json");
+  mcpSourceInput.value = initialPath;
+  loadFromPath(initialPath);
+
+  let loadTimer = null;
+  mcpSourceInput.addEventListener("input", () => {
+    clearTimeout(loadTimer);
+    loadTimer = setTimeout(() => {
+      const v = mcpSourceInput.value.trim();
+      if (v) localStorage.setItem("ciu_last_mcp_source", v);
+      loadFromPath(v);
+    }, 350);
+  });
+
   const submit = async () => {
     const cwd = cwdInput.value.trim();
     const command = cmdInput.value.trim() || "claude";
     if (!cwd) { cwdInput.focus(); return; }
     try {
       const resolved = cwd.startsWith("~") ? cwd.replace(/^~/, getHome()) : cwd;
-      const res = await api("POST", "/api/instances/new", { cwd: resolved, command });
+      const payload = { cwd: resolved, command };
+      const nm = (nameInput.value || "").trim();
+      if (nm) payload.name = nm;
+      if (typeof useMcps === "function") {
+        const selected = useMcps();
+        payload.mcps = selected;
+        const src = (mcpSourceInput.value || "").trim();
+        if (src) payload.mcp_source = src;
+        localStorage.setItem("ciu_last_mcps", JSON.stringify(selected));
+      }
+      const res = await api("POST", "/api/instances/new", payload);
       close();
       toast("Starting…");
       // Poll up to 5s for the new session to appear, then select it
@@ -1323,7 +1918,7 @@ async function showNewInstanceModal() {
     if (e.key === "Escape") close();
     if (e.key === "Enter" && (e.target === cwdInput || e.target === cmdInput)) submit();
   });
-  setTimeout(() => cwdInput.focus(), 20);
+  setTimeout(() => nameInput.focus(), 20);
 }
 
 function getHome() {
@@ -1338,14 +1933,159 @@ function getHome() {
 const newInstanceBtn = $("#newInstanceBtn");
 if (newInstanceBtn) newInstanceBtn.addEventListener("click", showNewInstanceModal);
 
+/* ------------------------------------------------------------------ */
+/*  File upload — clipboard paste + drag-and-drop                     */
+/* ------------------------------------------------------------------ */
+
+async function uploadAndInsertFiles(sid, files) {
+  if (!sid || !files || !files.length) return;
+  if (xtermManager.sid !== sid) {
+    toast("Select the instance first", { error: true });
+    return;
+  }
+
+  const t = toast.bind(null);
+  t(files.length === 1
+    ? `↑ uploading ${files[0].name || "image"}…`
+    : `↑ uploading ${files.length} files…`);
+
+  const paths = [];
+  for (const f of files) {
+    try {
+      const fd = new FormData();
+      fd.append("file", f, f.name || "image.png");
+      const headers = {};
+      if (AUTH_TOKEN) headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+      const res = await fetch(`/api/instances/${sid}/upload`, {
+        method: "POST", headers, body: fd,
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const data = await res.json();
+      paths.push(data.path);
+    } catch (err) {
+      toast(`Upload failed: ${err.message}`, { error: true });
+    }
+  }
+
+  if (!paths.length) return;
+
+  // Inject the plain path(s) into the terminal; user presses Enter themselves
+  // once they've typed any surrounding prompt text.
+  const insertion = paths.map((p) => p.includes(" ") ? `"${p}"` : p).join(" ") + " ";
+  if (!xtermManager.writeText(insertion)) {
+    toast("Terminal not connected", { error: true });
+    return;
+  }
+  xtermManager.focus();
+  toast(`Attached ${paths.length} file${paths.length > 1 ? "s" : ""}`);
+}
+
+// Clipboard paste — anywhere on the page, if there's an image file, grab it.
+// Capture phase so xterm's own paste handler doesn't also run.
+document.addEventListener("paste", async (e) => {
+  const sid = state.selectedSid;
+  if (!sid) return;
+  const items = e.clipboardData ? Array.from(e.clipboardData.items) : [];
+  const files = items
+    .filter((it) => it.kind === "file")
+    .map((it) => it.getAsFile())
+    .filter(Boolean);
+  if (!files.length) return;
+  e.preventDefault();
+  e.stopPropagation();
+  await uploadAndInsertFiles(sid, files);
+}, true);
+
+// Drag-and-drop: accept files dropped anywhere on the preview pane.
+(function wirePreviewDrop() {
+  const previewCol = document.getElementById("previewCol");
+  if (!previewCol) return;
+  let dragDepth = 0;
+  const markDrop = (on) => {
+    const host = document.getElementById("xtermHost");
+    if (host) host.classList.toggle("drop-target", on);
+    previewCol.classList.toggle("drop-target", on);
+  };
+  const onDragEnter = (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+    e.preventDefault();
+    dragDepth++;
+    markDrop(true);
+  };
+  const onDragLeave = () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) markDrop(false);
+  };
+  const onDragOver = (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+  const onDrop = async (e) => {
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    dragDepth = 0;
+    markDrop(false);
+    const sid = state.selectedSid;
+    if (!sid) { toast("Select an instance first", { error: true }); return; }
+    await uploadAndInsertFiles(sid, Array.from(e.dataTransfer.files));
+  };
+  previewCol.addEventListener("dragenter", onDragEnter);
+  previewCol.addEventListener("dragleave", onDragLeave);
+  previewCol.addEventListener("dragover", onDragOver);
+  previewCol.addEventListener("drop", onDrop);
+  // Also stop the browser from opening files dropped outside the preview.
+  window.addEventListener("dragover", (e) => {
+    if (e.dataTransfer?.types?.includes?.("Files")) e.preventDefault();
+  });
+  window.addEventListener("drop", (e) => {
+    if (e.dataTransfer?.types?.includes?.("Files") && !previewCol.contains(e.target)) {
+      e.preventDefault();
+    }
+  });
+})();
+
+// Sidebar collapse/expand — persists in localStorage
+(function () {
+  const sidebar = document.getElementById("sidebar");
+  const toggle = document.getElementById("sidebarToggle");
+  if (!sidebar || !toggle) return;
+  const apply = (collapsed) => {
+    document.body.classList.add("sidebar-transitioning");
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
+    toggle.textContent = collapsed ? "›" : "‹";
+    toggle.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+    setTimeout(() => {
+      document.body.classList.remove("sidebar-transitioning");
+      xtermManager.fit();
+    }, 220);
+  };
+  apply(localStorage.getItem("ciu_sidebar_collapsed") === "1");
+  toggle.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const next = !document.body.classList.contains("sidebar-collapsed");
+    localStorage.setItem("ciu_sidebar_collapsed", next ? "1" : "0");
+    apply(next);
+  });
+  sidebar.addEventListener("click", (e) => {
+    if (!document.body.classList.contains("sidebar-collapsed")) return;
+    if (e.target.closest(".config-nav") || e.target.closest(".group-nav-item")) return;
+    localStorage.setItem("ciu_sidebar_collapsed", "0");
+    apply(false);
+  });
+})();
+
 $("#openFullBtn").addEventListener("click", () => {
   api("POST", "/api/open-dashboard").catch((e) => toast(e.message, { error: true }));
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "/" && document.activeElement.tagName !== "INPUT") {
+  if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") {
+    const xtHost = document.querySelector(".xterm-helper-textarea");
+    if (xtHost && document.activeElement === xtHost) return; // xterm has focus → let it through
     e.preventDefault();
     $("#search").focus();
+    return;
   }
   if (e.key === "Escape" && document.activeElement === $("#search")) {
     $("#search").value = "";
@@ -1353,6 +2093,7 @@ document.addEventListener("keydown", (e) => {
     state.lastListSig = "";
     renderList();
     $("#search").blur();
+    return;
   }
 });
 

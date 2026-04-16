@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn[standard]", "httpx", "websockets"]
+# dependencies = ["fastapi", "uvicorn[standard]", "httpx", "websockets", "python-multipart"]
 # ///
 from __future__ import annotations
 
@@ -12,14 +12,13 @@ import pathlib
 import re
 import secrets
 import shlex
-import signal
 import subprocess
 import time
 from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -45,6 +44,10 @@ PUBLIC_BASE_URL = os.environ.get("CIU_PUBLIC_URL") or f"http://{HOST}:{PORT}"
 
 APP_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Timestamp pinned at import — clients watch this to detect a server restart
+# and can reload any cached UI (e.g. the Hammerspoon popover webview).
+SERVER_START = time.time()
 
 # ----------------------------------------------------------------------------
 # Auth
@@ -80,6 +83,11 @@ def _is_authenticated(request: Request) -> bool:
         return True
     cookie = request.cookies.get(COOKIE_NAME) or ""
     if cookie and secrets.compare_digest(cookie, AUTH_TOKEN):
+        return True
+    # Query-param fallback for contexts where cookies don't persist
+    # (e.g. Hammerspoon's WKWebView across the /auth→/ redirect boundary).
+    qtoken = request.query_params.get("t") or ""
+    if qtoken and secrets.compare_digest(qtoken, AUTH_TOKEN):
         return True
     return False
 
@@ -155,31 +163,6 @@ def ps_row(pid: int) -> dict:
     return _refresh_ps_cache().get(pid, {})
 
 
-_TTY_CACHE: dict[int, tuple[float, list[str]]] = {}
-_TTY_TTL = 5.0
-
-
-def walk_ttys(pid: int, max_depth: int = 10) -> list[str]:
-    cached = _TTY_CACHE.get(pid)
-    if cached and time.time() - cached[0] < _TTY_TTL:
-        return cached[1]
-    ps_map = _refresh_ps_cache()
-    seen: list[str] = []
-    current = pid
-    for _ in range(max_depth):
-        info = ps_map.get(current)
-        if not info:
-            break
-        tty = info.get("tty", "")
-        if tty and tty != "??" and tty not in seen:
-            seen.append(tty)
-        current = info.get("ppid", 0)
-        if current in (0, 1):
-            break
-    _TTY_CACHE[pid] = (time.time(), seen)
-    return seen
-
-
 def parse_mcp_arg(command: str) -> list[str]:
     try:
         tokens = shlex.split(command)
@@ -201,8 +184,8 @@ def parse_mcp_arg(command: str) -> list[str]:
 
 def load_mcps(cwd: str | None, command: str) -> dict[str, list[str]]:
     sources: dict[str, list[str]] = {"global": [], "project": [], "explicit": []}
-    if GLOBAL_MCP.exists():
-        sources["global"] = sorted((read_json(GLOBAL_MCP).get("mcpServers") or {}).keys())
+    global_defs = available_mcp_servers()
+    sources["global"] = sorted(global_defs.keys())
     if cwd:
         proj = pathlib.Path(cwd) / ".mcp.json"
         if proj.exists():
@@ -213,6 +196,30 @@ def load_mcps(cwd: str | None, command: str) -> dict[str, list[str]]:
             sources["explicit"].extend(sorted((read_json(p).get("mcpServers") or {}).keys()))
     sources["explicit"] = sorted(set(sources["explicit"]))
     return sources
+
+
+def available_mcp_servers() -> dict[str, dict]:
+    """Read MCP server definitions from global claude config files.
+
+    Kept for backward compatibility with /api/available-mcps — aggregates
+    ~/.claude.json and ~/.claude/mcp.json.
+    """
+    servers: dict[str, dict] = {}
+    for path in (HOME / ".claude.json", GLOBAL_MCP):
+        for name, spec in _mcp_servers_at(path).items():
+            if name not in servers:
+                servers[name] = spec
+    return servers
+
+
+def _mcp_servers_at(path: pathlib.Path) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    data = read_json(path)
+    mcps = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(mcps, dict):
+        return {}
+    return {n: s for n, s in mcps.items() if isinstance(s, dict)}
 
 
 def transcript_path_for(session_id: str, cwd: str | None) -> pathlib.Path | None:
@@ -529,11 +536,11 @@ def display_name(
 
 STOP_FRESH = 10.0
 NOTIFICATION_TTL = 1800.0
-RUNNING_HOOK_FRESH = 60.0
-GENERATION_MAX = 90.0
-PENDING_EXEC_MAX = 120.0
+# Staleness window: how long after the last activity signal do we
+# still trust "running". 30s is tight enough to catch idle quickly
+# but covers brief silent gaps between tool calls.
+RUNNING_STALENESS = 30.0
 APPROVAL_KEYWORDS = ("permission", "approval", "approve", "confirm", "allow")
-RUNNING_HOOKS = {"PreToolUse", "PostToolUse", "UserPromptSubmit", "SubagentStop"}
 
 
 def _is_approval_message(msg: str) -> bool:
@@ -560,12 +567,13 @@ def resolve_status(
     pending_tool = jsonl.get("pending_tool")
     last_type = jsonl.get("last_type")
 
-    if hook_event == "Stop" and hook_age < STOP_FRESH:
-        return "idle", None
+    # Freshest recent-activity signal. We only trust "running" when at
+    # least one of the two (hook or transcript) is still actively
+    # ticking. A stale hook with a quiet JSONL is almost certainly an
+    # orphaned state file, not a working session.
+    freshest = min(hook_age, jsonl_age)
 
-    if hook_event in RUNNING_HOOKS and hook_age < RUNNING_HOOK_FRESH:
-        return "running", None
-
+    # Approval prompt wins over everything else.
     if (
         hook_event == "Notification"
         and hook_age < NOTIFICATION_TTL
@@ -574,10 +582,23 @@ def resolve_status(
         label = hook_msg or (f"Awaiting approval: {pending_tool}" if pending_tool else "Needs input")
         return "needs_input", label
 
-    if last_type == "user" and jsonl_age < GENERATION_MAX:
+    # Any Notification hook (including "waiting for your input") means Claude
+    # is done working and waiting — treat as idle, not running.
+    if hook_event == "Notification":
+        return "idle", None
+
+    # Stop hook just fired: brief grace window, then fall through to idle.
+    if hook_event == "Stop" and hook_age < STOP_FRESH:
+        return "idle", None
+
+    # Non-Stop hook with recent activity somewhere (hook OR jsonl) → running.
+    if hook_event and hook_event != "Stop" and freshest < RUNNING_STALENESS:
         return "running", None
 
-    if pending and jsonl_age < PENDING_EXEC_MAX:
+    # JSONL-only fallbacks (hook may have missed, e.g. state file corruption).
+    if last_type == "user" and jsonl_age < RUNNING_STALENESS:
+        return "running", None
+    if pending and jsonl_age < RUNNING_STALENESS:
         return "running", None
 
     return "idle", None
@@ -650,11 +671,14 @@ def gather_instances() -> list[dict]:
             command = row.get("command", "")
             if alive and _is_headless(command):
                 continue
-            ttys = walk_ttys(pid) if alive else []
-            cwd = data.get("cwd")
             hook_state = read_json(STATE_DIR / f"{sid}.json")
             our_sid = hook_state.get("our_sid")
-            tmux_name = tmux_sessions_by_sid.get(our_sid) if our_sid else None
+            # Only surface tmux-owned sessions. Anything Claude spawned outside
+            # our dashboard (vanilla terminal, iTerm, etc.) is ignored.
+            if not our_sid:
+                continue
+            tmux_name = tmux_sessions_by_sid.get(our_sid)
+            cwd = data.get("cwd")
             jsonl_title, first_user = session_title(sid, cwd)
             tail = jsonl_tail(sid, cwd)
             summary = jsonl_summary(sid, cwd)
@@ -672,8 +696,6 @@ def gather_instances() -> list[dict]:
                 "cwd": cwd,
                 "kind": data.get("kind"),
                 "started_at": data.get("startedAt"),
-                "tty": ttys[0] if ttys else None,
-                "ttys": ttys,
                 "command": command,
                 "status": status,
                 "last_event": hook_state.get("last_event"),
@@ -705,11 +727,14 @@ def gather_instances() -> list[dict]:
         tp = data.get("transcript_path") or ""
         if "/subagents/" in tp:
             continue
+        our_sid = data.get("our_sid")
+        # Skip orphans that weren't ours — we only show sessions we spawned.
+        if not our_sid:
+            continue
         orphan_count += 1
         cwd = data.get("cwd")
         jsonl_title, first_user = session_title(sid, cwd)
-        our_sid = data.get("our_sid")
-        tmux_name = tmux_sessions_by_sid.get(our_sid) if our_sid else None
+        tmux_name = tmux_sessions_by_sid.get(our_sid)
         by_session[sid] = {
             "session_id": sid,
             "pid": None,
@@ -730,7 +755,6 @@ def gather_instances() -> list[dict]:
             "subagents": [],
             "group": next((g for g, ids in groups.items() if sid in ids), None),
             "ack_timestamp": acks.get(sid) or 0,
-            "ttys": [],
             "our_sid": our_sid,
             "tmux_session": tmux_name,
         }
@@ -743,6 +767,15 @@ def gather_instances() -> list[dict]:
         return (not alive, -latest)
 
     items = sorted(by_session.values(), key=_sort_key)
+    _promote_pending_names_for(items)
+    # Re-read names after possible promotion so the first response carries
+    # the newly-assigned display name.
+    fresh_names = read_json(NAMES_FILE)
+    for inst in items:
+        sid = inst.get("session_id")
+        if sid in fresh_names and fresh_names[sid]:
+            inst["custom_name"] = fresh_names[sid]
+            inst["name"] = fresh_names[sid]
     return items
 
 
@@ -774,7 +807,11 @@ def cached_instances() -> list[dict]:
 
 @app.get("/api/instances")
 def api_instances() -> dict:
-    return {"instances": cached_instances(), "served_at": time.time()}
+    return {
+        "instances": cached_instances(),
+        "served_at": time.time(),
+        "server_start": SERVER_START,
+    }
 
 
 @app.get("/api/groups")
@@ -818,18 +855,11 @@ def api_signal(session_id: str, body: KillBody) -> dict:
     if not target:
         raise HTTPException(status_code=404, detail="session not found")
     sig_name = body.signal.upper()
-    # Prefer tmux-backed send via pane fg-process if the session is ours
-    if target.get("our_sid") and target.get("tmux_session"):
-        tmux_backend.send_signal(target["our_sid"], sig_name)
-        return {"ok": True, "route": "tmux"}
-    pid = target.get("pid")
-    if not pid:
-        raise HTTPException(status_code=404, detail="pid not found")
-    sig = getattr(signal, f"SIG{sig_name}", None)
-    if sig is None:
-        raise HTTPException(status_code=400, detail="unknown signal")
-    os.kill(pid, sig)
-    return {"ok": True, "route": "pid"}
+    our_sid = target.get("our_sid")
+    if not our_sid:
+        raise HTTPException(status_code=400, detail="not a managed session")
+    tmux_backend.send_signal(our_sid, sig_name)
+    return {"ok": True}
 
 
 @app.delete("/api/instances/{session_id}")
@@ -843,6 +873,91 @@ def api_forget(session_id: str) -> dict:
 class NewInstanceBody(BaseModel):
     cwd: str
     command: str = "claude"
+    mcps: list[str] | None = None  # None = use claude defaults, [] = none, [...] = subset
+    mcp_source: str | None = None  # path to mcp.json to pull definitions from
+    name: str | None = None  # optional custom display name
+
+
+MCP_CONFIG_DIR = APP_DIR / "mcp-configs"
+PENDING_NAMES_FILE = APP_DIR / "pending_names.json"
+
+
+def _pending_name_for(our_sid: str) -> str | None:
+    """Return the pending name for an our_sid, if one was set at spawn-time."""
+    data = read_json(PENDING_NAMES_FILE)
+    return data.get(our_sid)
+
+
+def _stash_pending_name(our_sid: str, name: str) -> None:
+    data = read_json(PENDING_NAMES_FILE)
+    data[our_sid] = name
+    write_json(PENDING_NAMES_FILE, data)
+
+
+def _promote_pending_names_for(instances: list[dict]) -> None:
+    """Move pending names (keyed by our_sid) into names.json (keyed by
+    session_id) once we can correlate the two via hook state."""
+    pending = read_json(PENDING_NAMES_FILE)
+    if not pending:
+        return
+    names = read_json(NAMES_FILE)
+    changed = False
+    pending_changed = False
+    for inst in instances:
+        osid = inst.get("our_sid")
+        sid = inst.get("session_id")
+        if osid and osid in pending and sid and sid not in names:
+            names[sid] = pending.pop(osid)
+            changed = True
+            pending_changed = True
+    if changed:
+        write_json(NAMES_FILE, names)
+    if pending_changed:
+        write_json(PENDING_NAMES_FILE, pending)
+
+
+@app.get("/api/available-mcps")
+def api_available_mcps() -> dict:
+    """Return MCP server names across all known global sources (legacy)."""
+    return {"mcps": sorted(available_mcp_servers().keys())}
+
+
+@app.get("/api/mcp-sources")
+def api_mcp_sources() -> dict:
+    """Return candidate mcp.json paths and their MCP server names.
+
+    Scans common paths; each entry has {path, label, mcps, exists, count}.
+    The client uses this to let the user pick a source before picking MCPs.
+    """
+    candidates: list[tuple[str, pathlib.Path]] = [
+        ("Global (~/.claude.json)", HOME / ".claude.json"),
+        ("Legacy (~/.claude/mcp.json)", GLOBAL_MCP),
+    ]
+    sources: list[dict] = []
+    for label, p in candidates:
+        mcps = _mcp_servers_at(p)
+        sources.append({
+            "path": str(p),
+            "label": label,
+            "exists": p.exists(),
+            "mcps": sorted(mcps.keys()),
+            "count": len(mcps),
+        })
+    return {"sources": sources}
+
+
+class McpListBody(BaseModel):
+    path: str
+
+
+@app.post("/api/mcp-list")
+def api_mcp_list(body: McpListBody) -> dict:
+    """Read MCP server names from an arbitrary mcp.json path."""
+    p = pathlib.Path(body.path).expanduser()
+    if not p.exists():
+        return {"path": str(p), "exists": False, "mcps": []}
+    mcps = _mcp_servers_at(p)
+    return {"path": str(p), "exists": True, "mcps": sorted(mcps.keys())}
 
 
 @app.post("/api/instances/new")
@@ -855,13 +970,95 @@ def api_new_instance(body: NewInstanceBody) -> dict:
     cwd_path = pathlib.Path(body.cwd).expanduser()
     if not cwd_path.is_dir():
         raise HTTPException(status_code=400, detail=f"not a directory: {body.cwd}")
+    # Pre-authorize the uploads dir so pasted/dropped files can be read
+    # without triggering Claude's "permission to use Read" prompt every
+    # time — uploads live outside cwd by design.
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    command = f"{body.command} --add-dir {shlex.quote(str(UPLOAD_DIR))}"
+    if body.mcps is not None:
+        import secrets as _s
+        cfg_token = _s.token_hex(6)
+        MCP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        # Pull definitions from the source the user chose; fall back to any
+        # known source if one name can't be found there.
+        source_defs: dict[str, dict] = {}
+        if body.mcp_source:
+            source_defs = _mcp_servers_at(pathlib.Path(body.mcp_source).expanduser())
+        all_defs = available_mcp_servers() if not source_defs else source_defs
+        subset = {n: all_defs[n] for n in body.mcps if n in all_defs}
+        cfg_path = MCP_CONFIG_DIR / f"{cfg_token}.json"
+        write_json(cfg_path, {"mcpServers": subset})
+        command = f"{command} --mcp-config {shlex.quote(str(cfg_path))} --strict-mcp-config"
     try:
-        our_sid = tmux_backend.spawn(str(cwd_path), body.command)
+        our_sid = tmux_backend.spawn(str(cwd_path), command)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if body.name and body.name.strip():
+        _stash_pending_name(our_sid, body.name.strip())
     # Invalidate cache so new session appears on next poll
     _INSTANCES_CACHE["at"] = 0
     return {"ok": True, "our_sid": our_sid}
+
+
+class InputBody(BaseModel):
+    text: str
+    submit: bool = True
+
+
+@app.post("/api/instances/{session_id}/input")
+def api_input(session_id: str, body: InputBody) -> dict:
+    """Send a prompt to a tmux-owned Claude session as if typed at the UI.
+
+    Text and Enter are dispatched as two separate tmux calls with a short
+    settle delay between them — otherwise Claude's Ink-based TUI treats
+    the trailing \\r as part of the pasted text (adds a newline to the
+    buffer) instead of as a discrete submit keystroke.
+    """
+    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="session not found")
+    our_sid = target.get("our_sid")
+    if not our_sid:
+        raise HTTPException(status_code=400, detail="not a tmux-owned session")
+    text = body.text
+    if text:
+        tmux_backend.send_bytes(our_sid, text.encode("utf-8"))
+    if body.submit:
+        # Settle time. Long pastes (file paths) need this more — if the
+        # delay is too short the Enter collides with the paste's read
+        # burst and gets absorbed as a newline in the prompt buffer
+        # instead of submitting the turn.
+        settle = 0.3 if len(text) > 40 else 0.1
+        time.sleep(settle)
+        tmux_backend.send_enter(our_sid)
+    return {"ok": True}
+
+
+UPLOAD_DIR = APP_DIR / "uploads"
+_FILENAME_SAFE = re.compile(r"[^a-zA-Z0-9._-]")
+
+
+@app.post("/api/instances/{session_id}/upload")
+async def api_upload(session_id: str, file: UploadFile = File(...)) -> dict:
+    """Accept a clipboard-pasted image or a drag-and-dropped file. Writes it
+    to ~/.claude-instances-ui/uploads/<stamp>-<tok>-<name> and returns the
+    absolute path. The frontend inserts `@<path>` into the prompt so Claude
+    can pick it up with its file-reference syntax."""
+    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="session not found")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    raw_name = file.filename or "upload.bin"
+    safe = _FILENAME_SAFE.sub("_", raw_name)[:80] or "upload.bin"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    tok = secrets.token_hex(3)
+    path = UPLOAD_DIR / f"{stamp}-{tok}-{safe}"
+    data = await file.read()
+    # Reasonable cap so a huge drop doesn't fill the disk silently.
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="file too large (25 MB max)")
+    path.write_bytes(data)
+    return {"ok": True, "path": str(path), "name": raw_name, "size": len(data)}
 
 
 @app.post("/api/instances/{session_id}/kill")
@@ -874,6 +1071,46 @@ def api_kill_instance(session_id: str) -> dict:
         raise HTTPException(status_code=400, detail="session is not tmux-owned")
     tmux_backend.kill(our_sid)
     _INSTANCES_CACHE["at"] = 0
+    return {"ok": True}
+
+
+@app.post("/api/instances/{session_id}/open-terminal")
+def api_open_terminal(session_id: str) -> dict:
+    """Open this tmux session in a native macOS terminal window."""
+    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="session not found")
+    our_sid = target.get("our_sid")
+    if not our_sid:
+        raise HTTPException(status_code=400, detail="session is not tmux-owned")
+    if not tmux_backend.session_exists(our_sid):
+        raise HTTPException(status_code=404, detail="tmux session gone")
+
+    session_name = f"{tmux_backend.NAME_PREFIX}{our_sid}"
+    tmux_bin = tmux_backend.TMUX_BIN or "tmux"
+    attach_cmd = f"{tmux_bin} -L {tmux_backend.SOCKET_NAME} attach-session -t {session_name}"
+
+    # Prefer iTerm2 if installed, fall back to Terminal.app.
+    # No `activate` — that switches to the app's current Space before
+    # creating the window.  Without it the window is created on the
+    # user's current Space; they Cmd-Tab to it when ready.
+    if os.path.isdir("/Applications/iTerm.app"):
+        script = (
+            'tell application "iTerm"\n'
+            f'  create window with default profile command "{attach_cmd}"\n'
+            "end tell"
+        )
+    else:
+        script = (
+            'tell application "Terminal"\n'
+            f'  do script "{attach_cmd}"\n'
+            "end tell"
+        )
+    subprocess.Popen(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     return {"ok": True}
 
 
@@ -908,8 +1145,14 @@ def api_recent_cwds() -> dict:
 
 @app.websocket("/ws/instances/{session_id}/terminal")
 async def ws_terminal(ws: WebSocket, session_id: str) -> None:
-    # Manual auth: accept then validate, then close on mismatch.
-    # FastAPI doesn't pass Request to ws handlers through middleware.
+    """Bidirectional terminal over WebSocket using a real pty attachment.
+
+    Architecture (same as ttyd/wetty/gotty):
+      xterm.js  ⇄  WebSocket  ⇄  pty master fd  ⇄  tmux attach  ⇄  session
+    No pipe-pane, no send-keys, no FIFO. Input and output flow through the
+    same pty fd. Mouse events, scrollback (copy-mode), and resize all work
+    natively because we're a real tmux client.
+    """
     token = ws.query_params.get("t") or ""
     cookie = ws.cookies.get(COOKIE_NAME) or ""
     if not (
@@ -928,57 +1171,108 @@ async def ws_terminal(ws: WebSocket, session_id: str) -> None:
         return
     await ws.accept()
 
-    # Send initial scrollback
-    snapshot = tmux_backend.capture_pane(our_sid, lines=1000)
-    if snapshot:
-        try:
-            await ws.send_bytes(snapshot)
-        except Exception:
-            return
+    master_fd: int | None = None
+    proc: subprocess.Popen | None = None
+    out_task: asyncio.Task | None = None
+    loop = asyncio.get_event_loop()
 
-    send_queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-    async def forward_output() -> None:
-        try:
-            async for chunk in tmux_backend.stream_output(our_sid):
-                await ws.send_bytes(chunk)
-        except Exception:
-            pass
-
-    out_task = asyncio.create_task(forward_output())
     try:
+        # Wait for the client's first resize so the pty geometry is correct
+        # from the very first byte tmux sends.
+        cols, rows = 80, 24
+        first = await ws.receive()
+        if "text" in first and first["text"]:
+            try:
+                p = json.loads(first["text"])
+                if p.get("type") == "resize":
+                    cols = int(p.get("cols") or 80)
+                    rows = int(p.get("rows") or 24)
+            except Exception:
+                pass
+
+        master_fd, proc = tmux_backend.pty_attach(our_sid, cols, rows)
+        # Also tell tmux to resize the window itself (window-size is manual)
+        tmux_backend.resize_pane(our_sid, cols, rows)
+
+        # --- Output: pty → WebSocket ---
+        output_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
+
+        def _on_pty_readable() -> None:
+            try:
+                data = os.read(master_fd, 65536)
+                if data:
+                    try:
+                        output_q.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
+                else:
+                    output_q.put_nowait(None)
+            except OSError:
+                output_q.put_nowait(None)
+
+        loop.add_reader(master_fd, _on_pty_readable)
+
+        async def _forward_output() -> None:
+            try:
+                while True:
+                    chunk = await output_q.get()
+                    if chunk is None:
+                        break
+                    await ws.send_bytes(chunk)
+            except Exception:
+                pass
+
+        out_task = asyncio.create_task(_forward_output())
+
+        # --- Input: WebSocket → pty ---
         while True:
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
             if "bytes" in msg and msg["bytes"] is not None:
-                tmux_backend.send_bytes(our_sid, msg["bytes"])
+                os.write(master_fd, msg["bytes"])
             elif "text" in msg and msg["text"] is not None:
-                text = msg["text"]
-                # Text frames are JSON control messages: {"type":"input"|"resize", ...}
                 try:
-                    payload = json.loads(text)
+                    payload = json.loads(msg["text"])
                 except Exception:
-                    # Legacy: treat as raw keystrokes
-                    tmux_backend.send_bytes(our_sid, text.encode("utf-8"))
                     continue
                 kind = payload.get("type")
-                if kind == "input":
+                if kind == "resize":
+                    c = int(payload.get("cols") or 80)
+                    r = int(payload.get("rows") or 24)
+                    tmux_backend.pty_resize(master_fd, c, r)
+                    tmux_backend.resize_pane(our_sid, c, r)
+                elif kind == "input":
                     data = payload.get("data", "")
-                    if isinstance(data, str) and data:
-                        tmux_backend.send_bytes(our_sid, data.encode("utf-8"))
-                elif kind == "resize":
-                    cols = int(payload.get("cols") or 80)
-                    rows = int(payload.get("rows") or 24)
-                    tmux_backend.resize_pane(our_sid, cols, rows)
+                    if data:
+                        os.write(master_fd, data.encode("utf-8"))
     except WebSocketDisconnect:
         pass
+    except Exception:
+        pass
     finally:
-        out_task.cancel()
-        try:
-            await out_task
-        except Exception:
-            pass
+        if master_fd is not None:
+            try:
+                loop.remove_reader(master_fd)
+            except Exception:
+                pass
+        if out_task is not None:
+            out_task.cancel()
+            try:
+                await out_task
+            except Exception:
+                pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
 
 
 class AckBody(BaseModel):
@@ -995,10 +1289,401 @@ def api_ack(session_id: str, body: AckBody) -> dict:
     return {"ok": True, "ack_timestamp": acks.get(session_id) or 0}
 
 
-@app.post("/api/open-dashboard")
-def api_open_dashboard() -> dict:
-    subprocess.Popen(["open", f"{PUBLIC_BASE_URL}/"])
+# ======================================================================
+#  Configuration management — MCP JSON + Skills (slash commands)
+# ======================================================================
+
+GLOBAL_MCP_PATHS = [
+    ("Global (~/.claude.json)", HOME / ".claude.json"),
+    ("MCP (~/.claude/mcp.json)", CLAUDE_DIR / "mcp.json"),
+]
+GLOBAL_COMMANDS_DIR = CLAUDE_DIR / "commands"
+
+
+def _read_json_safe(p: pathlib.Path) -> dict:
+    try:
+        return json.loads(p.read_text()) if p.is_file() else {}
+    except Exception:
+        return {}
+
+
+def _write_json_pretty(p: pathlib.Path, data: dict) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+# ---- MCP endpoints ----
+
+@app.get("/api/config/mcp")
+def api_config_mcp_list() -> dict:
+    """List all known MCP config files with their servers."""
+    results: list[dict] = []
+    for label, p in GLOBAL_MCP_PATHS:
+        data = _read_json_safe(p)
+        servers = data.get("mcpServers", {})
+        results.append({
+            "path": str(p),
+            "label": label,
+            "exists": p.is_file(),
+            "servers": list(servers.keys()),
+        })
+    # Per-instance configs — extract from each instance's --mcp-config flag
+    for inst in cached_instances():
+        cmd = inst.get("command") or ""
+        m = re.search(r"--mcp-config\s+(\S+)", cmd)
+        if not m:
+            continue
+        cfg_path = pathlib.Path(m.group(1))
+        if not cfg_path.is_file():
+            continue
+        data = _read_json_safe(cfg_path)
+        servers = data.get("mcpServers", {})
+        name = inst.get("name") or inst.get("our_sid", "")[:8]
+        results.append({
+            "path": str(cfg_path),
+            "label": f"Instance ({name})",
+            "exists": True,
+            "servers": list(servers.keys()),
+            "session_id": inst["session_id"],
+        })
+    # Per-project .mcp.json from active instance cwds
+    seen_cwds: set[str] = set()
+    for inst in cached_instances():
+        cwd = inst.get("cwd")
+        if not cwd or cwd in seen_cwds:
+            continue
+        seen_cwds.add(cwd)
+        proj_mcp = pathlib.Path(cwd) / ".mcp.json"
+        if proj_mcp.is_file():
+            data = _read_json_safe(proj_mcp)
+            servers = data.get("mcpServers", {})
+            results.append({
+                "path": str(proj_mcp),
+                "label": f"Project ({pathlib.Path(cwd).name})",
+                "exists": True,
+                "servers": list(servers.keys()),
+            })
+    return {"configs": results}
+
+
+class ConfigFileBody(BaseModel):
+    path: str
+
+
+@app.post("/api/config/mcp/read")
+def api_config_mcp_read(body: ConfigFileBody) -> dict:
+    """Read an MCP JSON config file."""
+    p = pathlib.Path(body.path).expanduser()
+    if not p.is_file():
+        return {"path": str(p), "exists": False, "content": "{}"}
+    return {"path": str(p), "exists": True, "content": p.read_text()}
+
+
+class ConfigWriteBody(BaseModel):
+    path: str
+    content: str
+
+
+@app.post("/api/config/mcp/write")
+def api_config_mcp_write(body: ConfigWriteBody) -> dict:
+    """Write an MCP JSON config file. Validates JSON before writing."""
+    p = pathlib.Path(body.path).expanduser()
+    try:
+        parsed = json.loads(body.content)
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, f"Invalid JSON: {e}")
+    _write_json_pretty(p, parsed)
+    return {"ok": True, "path": str(p)}
+
+
+# ---- Skills / Commands endpoints ----
+
+@app.get("/api/config/skills")
+def api_config_skills_list() -> dict:
+    """List all skill files (global + per-project for active instances)."""
+    results: list[dict] = []
+
+    def _scan_dir(d: pathlib.Path, label: str, scope: str) -> None:
+        if not d.is_dir():
+            return
+        for f in sorted(d.rglob("*.md")):
+            rel = f.relative_to(d)
+            results.append({
+                "path": str(f),
+                "name": str(rel).removesuffix(".md"),
+                "label": label,
+                "scope": scope,
+            })
+
+    _scan_dir(GLOBAL_COMMANDS_DIR, "Global", "global")
+    seen: set[str] = set()
+    for inst in cached_instances():
+        cwd = inst.get("cwd")
+        if not cwd or cwd in seen:
+            continue
+        seen.add(cwd)
+        proj_dir = pathlib.Path(cwd) / ".claude" / "commands"
+        if proj_dir.is_dir():
+            _scan_dir(proj_dir, f"Project ({pathlib.Path(cwd).name})", cwd)
+
+    return {"skills": results}
+
+
+@app.post("/api/config/skill/read")
+def api_config_skill_read(body: ConfigFileBody) -> dict:
+    """Read a skill markdown file."""
+    p = pathlib.Path(body.path).expanduser()
+    if not p.is_file():
+        return {"path": str(p), "exists": False, "content": ""}
+    return {"path": str(p), "exists": True, "content": p.read_text()}
+
+
+@app.post("/api/config/skill/write")
+def api_config_skill_write(body: ConfigWriteBody) -> dict:
+    """Write a skill markdown file."""
+    p = pathlib.Path(body.path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body.content)
+    return {"ok": True, "path": str(p)}
+
+
+class SkillCreateBody(BaseModel):
+    scope: str  # "global" or a cwd path
+    name: str   # e.g. "my-skill" (no .md)
+
+
+@app.post("/api/config/skill/create")
+def api_config_skill_create(body: SkillCreateBody) -> dict:
+    """Create a new empty skill file."""
+    if body.scope == "global":
+        base = GLOBAL_COMMANDS_DIR
+    else:
+        base = pathlib.Path(body.scope) / ".claude" / "commands"
+    p = base / f"{body.name}.md"
+    if p.exists():
+        raise HTTPException(409, f"Skill already exists: {p}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"---\ndescription: {body.name}\n---\n\n")
+    return {"ok": True, "path": str(p)}
+
+
+class SkillDeleteBody(BaseModel):
+    path: str
+
+
+@app.post("/api/config/skill/delete")
+def api_config_skill_delete(body: SkillDeleteBody) -> dict:
+    """Delete a skill file."""
+    p = pathlib.Path(body.path).expanduser()
+    if not p.is_file():
+        raise HTTPException(404, "Skill not found")
+    p.unlink()
     return {"ok": True}
+
+
+# ---- CLAUDE.md endpoints ----
+
+@app.get("/api/config/claudemd")
+def api_config_claudemd_list() -> dict:
+    """List all discoverable CLAUDE.md files (global + per-instance cwd)."""
+    results: list[dict] = []
+    # Global
+    global_md = CLAUDE_DIR / "CLAUDE.md"
+    results.append({
+        "path": str(global_md),
+        "label": "Global (~/.claude/CLAUDE.md)",
+        "exists": global_md.is_file(),
+        "scope": "global",
+    })
+    # Per-instance: CLAUDE.md at each active instance's cwd root
+    seen: set[str] = set()
+    for inst in cached_instances():
+        cwd = inst.get("cwd")
+        if not cwd or cwd in seen:
+            continue
+        seen.add(cwd)
+        proj_md = pathlib.Path(cwd) / "CLAUDE.md"
+        name = pathlib.Path(cwd).name
+        results.append({
+            "path": str(proj_md),
+            "label": f"Project ({name})",
+            "exists": proj_md.is_file(),
+            "scope": cwd,
+        })
+        # Also check for .claude/CLAUDE.md in project
+        nested_md = pathlib.Path(cwd) / ".claude" / "CLAUDE.md"
+        if nested_md.is_file() and str(nested_md) != str(proj_md):
+            results.append({
+                "path": str(nested_md),
+                "label": f"Project .claude/ ({name})",
+                "exists": True,
+                "scope": cwd,
+            })
+    return {"files": results}
+
+
+@app.post("/api/config/claudemd/read")
+def api_config_claudemd_read(body: ConfigFileBody) -> dict:
+    p = pathlib.Path(body.path).expanduser()
+    if not p.is_file():
+        return {"path": str(p), "exists": False, "content": ""}
+    return {"path": str(p), "exists": True, "content": p.read_text()}
+
+
+@app.post("/api/config/claudemd/write")
+def api_config_claudemd_write(body: ConfigWriteBody) -> dict:
+    p = pathlib.Path(body.path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body.content)
+    return {"ok": True, "path": str(p)}
+
+
+@app.get("/api/debug/capture/{session_id}")
+def api_debug_capture(session_id: str, scrollback: int = 0) -> dict:
+    """Return what tmux capture-pane emits for a session — useful for
+    diagnosing xterm render issues without the browser in the loop.
+
+    `scrollback=N` requests N lines of history (default 0 = visible only).
+    """
+    target = next((i for i in cached_instances() if i["session_id"] == session_id), None)
+    if not target or not target.get("our_sid"):
+        raise HTTPException(404, "session not found or not owned")
+    our_sid = target["our_sid"]
+    if not tmux_backend.session_exists(our_sid):
+        raise HTTPException(404, "tmux session gone")
+
+    # Capture with and without escapes so we can see both the rendered text
+    # and the raw ANSI stream that xterm is being asked to render.
+    argv_base = ["capture-pane", "-p", "-t", f"{tmux_backend.NAME_PREFIX}{our_sid}"]
+    if scrollback > 0:
+        argv_base += ["-S", f"-{int(scrollback)}"]
+
+    # Plain text (no escapes) — the rendered grid, stripped.
+    plain_res = tmux_backend._tmux(*argv_base)
+    plain = plain_res.stdout if plain_res.returncode == 0 else ""
+
+    # Escape-preserving — what we actually send to xterm over the WS.
+    esc_res = tmux_backend._tmux(*argv_base, "-e")
+    escaped_raw = esc_res.stdout if esc_res.returncode == 0 else ""
+    # Escape the ESC byte so it's safe to render inline
+    escaped_visible = escaped_raw.replace("\x1b", "\\e")
+
+    # Quick pattern tally — which suspects are in the stream?
+    patterns = {
+        "SGR_underline_4":     escaped_raw.count("\x1b[4m"),
+        "SGR_inverse_7":       escaped_raw.count("\x1b[7m"),
+        "SGR_overline_53":     escaped_raw.count("\x1b[53m"),
+        "half_block_upper_▀":  escaped_raw.count("▀"),
+        "half_block_lower_▄":  escaped_raw.count("▄"),
+        "full_block_█":        escaped_raw.count("█"),
+        "light_horizontal_─":  escaped_raw.count("─"),
+        "heavy_horizontal_━":  escaped_raw.count("━"),
+        "double_horizontal_═": escaped_raw.count("═"),
+    }
+    import re
+    bg_256 = re.findall(r"\x1b\[[\d;]*48;5;(\d+)", escaped_raw)
+    bg_rgb = re.findall(r"\x1b\[[\d;]*48;2;(\d+);(\d+);(\d+)", escaped_raw)
+    bg_basic = re.findall(r"\x1b\[(?:[\d;]*;)?(4[0-7]|10[0-7])m", escaped_raw)
+
+    return {
+        "our_sid": our_sid,
+        "scrollback_lines": scrollback,
+        "bytes_plain": len(plain),
+        "bytes_escaped": len(escaped_raw),
+        "plain": plain,
+        "escaped_visible": escaped_visible,
+        "pattern_counts": patterns,
+        "bg_256_colors_used": sorted(set(int(x) for x in bg_256)),
+        "bg_rgb_colors_used": sorted(set(tuple(map(int, x)) for x in bg_rgb)),
+        "bg_basic_codes_used": sorted(set(bg_basic)),
+    }
+
+
+class OpenDashboardBody(BaseModel):
+    sid: str | None = None
+
+
+@app.post("/api/open-dashboard")
+def api_open_dashboard(body: OpenDashboardBody | None = None) -> dict:
+    sid = body.sid if body else None
+    base = f"{PUBLIC_BASE_URL}/"
+    query: list[str] = []
+    if sid:
+        query.append(f"sid={sid}")
+    focus_url = base + (("?" + "&".join(query)) if query else "")
+    # For first-time-open fallback, append the token so a fresh tab auth's
+    # without needing a manual /auth visit.
+    open_query = query + [f"t={AUTH_TOKEN}"]
+    open_url = base + "?" + "&".join(open_query)
+
+    host_filter = f"{HOST}:{PORT}"
+    # Try to focus an existing authenticated tab first.
+    if _try_focus_existing(host_filter, focus_url):
+        return {"ok": True, "result": "focused"}
+    subprocess.Popen(["open", open_url])
+    return {"ok": True, "result": "opened"}
+
+
+def _try_focus_existing(host_filter: str, target_url: str) -> bool:
+    def run(script: str) -> str:
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=3,
+            )
+            return (r.stdout or "").strip()
+        except Exception:
+            return ""
+
+    for app in ("Arc", "Google Chrome", "Brave Browser", "Microsoft Edge", "Vivaldi"):
+        script = f'''
+        if application "{app}" is running then
+          using terms from application "Google Chrome"
+            tell application "{app}"
+              repeat with w in windows
+                set i to 0
+                repeat with t in tabs of w
+                  set i to i + 1
+                  try
+                    if (URL of t as string) contains "{host_filter}" then
+                      set URL of t to "{target_url}"
+                      set active tab index of w to i
+                      set index of w to 1
+                      activate
+                      return "focused"
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end tell
+          end using terms from
+        end if
+        return "nf"
+        '''
+        if run(script) == "focused":
+            return True
+
+    safari = f'''
+    if application "Safari" is running then
+      tell application "Safari"
+        repeat with w in windows
+          repeat with t in tabs of w
+            try
+              if (URL of t as string) contains "{host_filter}" then
+                set URL of t to "{target_url}"
+                set current tab of w to t
+                set index of w to 1
+                activate
+                return "focused"
+              end if
+            end try
+          end repeat
+        end repeat
+      end tell
+    end if
+    return "nf"
+    '''
+    return run(safari) == "focused"
 
 
 @app.get("/api/instances/{session_id}/transcript")
@@ -1086,7 +1771,6 @@ def api_transcript(session_id: str, limit: int = 60) -> dict:
             "status": inst["status"],
             "cwd": inst.get("cwd"),
             "pid": inst.get("pid"),
-            "tty": inst.get("tty"),
             "group": inst.get("group"),
             "mcps": inst.get("mcps"),
             "notification_message": inst.get("notification_message"),
@@ -1096,6 +1780,8 @@ def api_transcript(session_id: str, limit: int = 60) -> dict:
             "alive": inst.get("alive"),
             "summary": inst.get("summary"),
             "subagents": inst.get("subagents") or [],
+            "our_sid": inst.get("our_sid"),
+            "tmux_session": inst.get("tmux_session"),
         },
         "entries": entries,
     }
@@ -1124,6 +1810,20 @@ def auth(request: Request, t: str = "") -> Response:
 
 @app.get("/")
 def index(request: Request) -> Response:
+    # Allow zero-click auth: if ?t=<token> matches, set the cookie and serve
+    # the index directly. This is what fixes the Hammerspoon WKWebView popover
+    # which doesn't always persist cookies across a /auth→/ redirect boundary.
+    t = request.query_params.get("t") or ""
+    if t and secrets.compare_digest(t, AUTH_TOKEN):
+        resp = FileResponse(STATIC_DIR / "index.html")
+        resp.set_cookie(
+            key=COOKIE_NAME,
+            value=AUTH_TOKEN,
+            httponly=True,
+            samesite="lax",
+            max_age=60 * 60 * 24 * 365,
+        )
+        return resp
     if not _is_authenticated(request):
         return HTMLResponse(
             """<!doctype html><html><head><meta charset="utf-8">
