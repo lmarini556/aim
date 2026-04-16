@@ -1,4 +1,4 @@
-# Claude Instances UI
+# Agent Instances Manager 
 
 A browser-native control room for multiple concurrent [Claude Code](https://claude.com/claude-code) sessions. Create sessions, drive them interactively in your browser, and glance at their state from a macOS menu-bar tray — all without leaving the web UI.
 
