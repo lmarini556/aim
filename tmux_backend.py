@@ -59,6 +59,21 @@ def _fifo_path(our_sid: str) -> pathlib.Path:
     return FIFO_DIR / f"{our_sid}.fifo"
 
 
+_global_keys_set = False
+
+
+def _ensure_global_keys() -> None:
+    """Set server-wide tmux options once per process lifetime."""
+    global _global_keys_set
+    if _global_keys_set:
+        return
+    _global_keys_set = True
+    _tmux("set-option", "-g", "extended-keys", "always")
+    _tmux("set-option", "-g", "-a", "terminal-features",
+          ",xterm-256color:extkeys")
+    _tmux("bind-key", "-n", "S-Enter", "send-keys", "Escape", "[13;2u")
+
+
 @dataclass
 class TmuxSession:
     our_sid: str
@@ -114,6 +129,7 @@ def spawn(cwd: str, command: str = "claude", extra_env: dict[str, str] | None = 
     """
     if not tmux_available():
         raise RuntimeError("tmux not installed — run: brew install tmux")
+    _ensure_global_keys()
     our_sid = _new_our_sid()
     name = _session_name(our_sid)
     env = os.environ.copy()
@@ -152,6 +168,13 @@ def spawn(cwd: str, command: str = "claude", extra_env: dict[str, str] | None = 
     _tmux("set-option", "-t", name, "mouse", "on")
     # Generous scrollback for long Claude conversations
     _tmux("set-option", "-t", name, "history-limit", "50000")
+    # Keep pane alive if Claude exits so the user can see errors
+    _tmux("set-option", "-t", name, "remain-on-exit", "on")
+    # Extended keys so Shift+Enter and other modified keys reach Claude.
+    # "always" enables CSI u forwarding without waiting for the inner app
+    # to request it via the kitty keyboard protocol activation sequence.
+    _tmux("set-option", "-t", name, "extended-keys", "always")
+    _tmux("set-option", "-t", name, "-a", "terminal-features", ",xterm-256color:extkeys")
     return our_sid
 
 
@@ -230,6 +253,19 @@ def kill(our_sid: str) -> None:
         fifo.unlink()
     except FileNotFoundError:
         pass
+
+
+def send_shift_enter(our_sid: str) -> None:
+    """Send Shift+Enter (CSI u: ESC[13;2u) as raw hex bytes into the pane.
+
+    Uses send-keys -H to bypass tmux's input parser entirely, injecting
+    the bytes directly into the pane's stdin.
+    """
+    if not tmux_available():
+        return
+    # \x1b [ 1 3 ; 2 u
+    _tmux("send-keys", "-H", "-t", _session_name(our_sid),
+          "1b", "5b", "31", "33", "3b", "32", "75")
 
 
 def send_signal(our_sid: str, sig: str = "INT") -> None:

@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://rsms.me/" />
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-    <link rel="stylesheet" href="/static/style.css?v=70" />
+    <link rel="stylesheet" href="/static/style.css?v=71" />
   </head>
   <body>
     <aside id="sidebar">
@@ -36,6 +36,10 @@
         <button class="config-nav" data-config="claudemd" title="CLAUDE.md instructions">
           <span class="config-icon">📋</span>
           <span class="config-nav-label">CLAUDE.md</span>
+        </button>
+        <button class="config-nav" id="settingsHammerspoon" title="Settings">
+          <span class="config-icon">⚙</span>
+          <span class="config-nav-label">Settings</span>
         </button>
       </div>
       <div class="foot">
@@ -200,6 +204,37 @@
       </div>
     </template>
 
+    <template id="settingsTpl">
+      <div class="modal-backdrop settings-modal">
+        <div class="modal-card">
+          <h2>Settings</h2>
+          <div class="settings-status" id="hsStatus"></div>
+
+          <label class="modal-label">Notification sound</label>
+          <label class="settings-toggle">
+            <input type="checkbox" id="hsSound" checked />
+            <span>Play chime on status change</span>
+          </label>
+
+          <label class="modal-label">Banner duration (seconds)</label>
+          <input class="modal-input" id="hsBannerTtl" type="number" min="5" max="120" value="30" />
+
+          <label class="modal-label">Poll interval (seconds)</label>
+          <input class="modal-input" id="hsPollInterval" type="number" min="1" max="30" value="2" />
+
+          <div class="settings-actions">
+            <button class="modal-btn" id="hsInstall">Install / Update Module</button>
+            <button class="modal-btn" id="hsReload">Reload Hammerspoon</button>
+          </div>
+
+          <div class="modal-actions">
+            <button class="modal-btn cancel">Close</button>
+            <button class="modal-btn primary save-settings">Save</button>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <div id="toast"></div>
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
@@ -207,6 +242,6 @@
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-canvas@0.5.0/lib/xterm-addon-canvas.min.js"></script>
     <script src="/static/sprite.js?v=57"></script>
-    <script src="/static/app.js?v=71"></script>
+    <script src="/static/app.js?v=73"></script>
   </body>
 </html>

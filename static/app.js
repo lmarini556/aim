@@ -2,7 +2,7 @@
 // chip) whether a refresh actually pulled the latest code. If you don't
 // see "CIU-BUILD-44" in the console AND a small orange "44" chip in the
 // bottom-right corner, the browser is serving cached JS.
-const CIU_BUILD = "CIU-BUILD-65";
+const CIU_BUILD = "CIU-BUILD-67";
 console.log(`[ciu] ${CIU_BUILD} loaded at`, new Date().toISOString());
 (() => {
   const stamp = document.createElement("div");
@@ -267,6 +267,16 @@ const xtermManager = (() => {
       try { term.loadAddon(new window.WebLinksAddon.WebLinksAddon()); } catch {}
     }
     term.open(host);
+
+    host.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "input", data: "\x1b[13;2u" }));
+        }
+      }
+    }, true);
 
     // Pixel-aligned renderer — default DOM renderer smears row backgrounds
     // across fractional pixels, producing pale horizontal banding between
@@ -1378,16 +1388,23 @@ async function showEditModal(session) {
     restartBtn.addEventListener("click", async () => {
       const newCwd = cwdI.value.trim();
       if (!newCwd) { cwdI.focus(); return; }
-      if (!confirm(`Restart with new config?\nThis kills the current tmux session and spawns a new one in ${newCwd}.\nThe conversation will be resumed via --resume.`)) return;
+      const cwdChanged = newCwd !== (session.cwd || "");
+      const resumeNote = cwdChanged ? "Fresh session (CWD changed)." : "Conversation will be continued.";
+      if (!confirm(`Restart with new config?\n${resumeNote}`)) return;
       try {
-        await api("PUT", `/api/instances/${session.session_id}/name`, { name: nameI.value.trim() });
-        await api("PUT", `/api/instances/${session.session_id}/group`, { group: groupI.value.trim() || null });
         const oldSessionId = session.session_id;
-        await api("POST", `/api/instances/${session.session_id}/kill`).catch(() => {});
+        const newName = nameI.value.trim();
+        const newGroup = groupI.value.trim() || null;
+        await api("PUT", `/api/instances/${oldSessionId}/name`, { name: newName });
+        await api("PUT", `/api/instances/${oldSessionId}/group`, { group: newGroup });
+        await api("POST", `/api/instances/${oldSessionId}/kill`).catch(() => {});
+        await new Promise((r) => setTimeout(r, 600));
+        const cmd = cwdChanged ? "claude" : "claude --continue";
         const payload = {
           cwd: newCwd,
-          command: `claude --resume ${oldSessionId}`,
-          name: nameI.value.trim() || undefined,
+          command: cmd,
+          name: newName || undefined,
+          group: newGroup || undefined,
         };
         if (typeof useMcps === "function") {
           payload.mcps = useMcps();
@@ -1395,13 +1412,14 @@ async function showEditModal(session) {
         }
         const res = await api("POST", "/api/instances/new", payload);
         close();
-        toast("Restarted (resuming conversation)");
-        const deadline = Date.now() + 5000;
+        toast("Restarting…");
+        const deadline = Date.now() + 12000;
         const tick = async () => {
           await refresh();
           const match = state.instances.find((i) => i.our_sid === res.our_sid);
-          if (match) { selectInstance(match.session_id); return; }
-          if (Date.now() < deadline) setTimeout(tick, 300);
+          if (match) { selectInstance(match.session_id); toast("Restarted"); return; }
+          if (Date.now() < deadline) { setTimeout(tick, 400); return; }
+          toast("Instance spawned but not yet visible — check the terminal", { error: true });
         };
         tick();
       } catch (e) {
@@ -1479,18 +1497,23 @@ async function refresh() {
   if (_refreshing) return;
   _refreshing = true;
   try {
-    const { instances, served_at } = await api("GET", "/api/instances");
+    const resp = await api("GET", "/api/instances");
+    const { instances, served_at, pending_focus } = resp;
     state.instances = instances;
     $("#updated").textContent = `updated ${new Date(served_at * 1000).toLocaleTimeString()}`;
     renderNav();
     renderGroupNav();
     renderList();
-    // Auto-select an sid passed via the URL (e.g. from the Hammerspoon popover)
     if (_pendingSidFromUrl) {
       const match = instances.find((i) => i.session_id === _pendingSidFromUrl);
+      if (match) selectInstance(match.session_id);
+      _pendingSidFromUrl = null;
+    }
+    if (pending_focus) {
+      const match = instances.find((i) => i.session_id === pending_focus);
       if (match) {
         selectInstance(match.session_id);
-        _pendingSidFromUrl = null;
+        api("DELETE", "/api/pending-focus").catch(() => {});
       }
     }
     if (state.selectedSid) await loadTranscript();
@@ -1696,6 +1719,7 @@ const configEditor = (() => {
 $$(".config-nav").forEach((btn) =>
   btn.addEventListener("click", () => {
     const m = btn.dataset.config;
+    if (!m) return;
     if (configEditor.mode === m) configEditor.close();
     else configEditor.open(m);
   })
@@ -2096,6 +2120,77 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 });
+
+/* ------------------------------------------------------------------ */
+/*  Settings panel (Hammerspoon menu bar)                              */
+/* ------------------------------------------------------------------ */
+function showSettingsPanel() {
+  const tpl = $("#settingsTpl");
+  if (!tpl) return;
+  const bd = tpl.content.firstElementChild.cloneNode(true);
+  document.body.append(bd);
+
+  const status = bd.querySelector("#hsStatus");
+  const soundCb = bd.querySelector("#hsSound");
+  const ttlInput = bd.querySelector("#hsBannerTtl");
+  const pollInput = bd.querySelector("#hsPollInterval");
+
+  api("GET", "/api/settings").then((s) => {
+    soundCb.checked = s.sound !== false;
+    ttlInput.value = s.banner_ttl || 30;
+    pollInput.value = s.poll_interval || 2;
+    const parts = [];
+    parts.push(s.hs_installed ? "Module installed" : "Module not installed");
+    parts.push(s.hs_running ? "Hammerspoon running" : "Hammerspoon not running");
+    status.textContent = parts.join(" · ");
+    status.className = "settings-status " + (s.hs_installed && s.hs_running ? "ok" : "warn");
+  }).catch(() => {
+    status.textContent = "Could not load settings";
+    status.className = "settings-status warn";
+  });
+
+  const close = () => bd.remove();
+  bd.querySelector(".cancel").addEventListener("click", close);
+  bd.addEventListener("click", (e) => { if (e.target === bd) close(); });
+  bd.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+
+  bd.querySelector(".save-settings").addEventListener("click", async () => {
+    try {
+      await api("PUT", "/api/settings", {
+        sound: soundCb.checked,
+        banner_ttl: parseInt(ttlInput.value) || 30,
+        poll_interval: parseInt(pollInput.value) || 2,
+      });
+      toast("Settings saved");
+      close();
+    } catch (e) {
+      toast(`Save failed: ${e.message}`, { error: true });
+    }
+  });
+
+  bd.querySelector("#hsInstall").addEventListener("click", async () => {
+    try {
+      await api("POST", "/api/settings/install-hammerspoon");
+      toast("Module installed — reload Hammerspoon to apply");
+      status.textContent = "Module installed · reload Hammerspoon to apply";
+      status.className = "settings-status ok";
+    } catch (e) {
+      toast(`Install failed: ${e.message}`, { error: true });
+    }
+  });
+
+  bd.querySelector("#hsReload").addEventListener("click", async () => {
+    try {
+      await api("POST", "/api/settings/reload-hammerspoon");
+      toast("Reload signal sent");
+    } catch (e) {
+      toast(`Reload failed: ${e.message}`, { error: true });
+    }
+  });
+}
+
+const settingsBtn = $("#settingsHammerspoon");
+if (settingsBtn) settingsBtn.addEventListener("click", showSettingsPanel);
 
 if (new URLSearchParams(location.search).get("compact") === "1") {
   document.documentElement.classList.add("compact");

@@ -300,9 +300,37 @@ local function themedBanner(kind, info, sid)
     }
   end
 
+  -- Dismiss X button — top-right corner
+  local xSize = 26
+  local xPad = 8
+  canvas[#canvas + 1] = {
+    type = "rectangle",
+    action = "fill",
+    fillColor = { red = 1, green = 1, blue = 1, alpha = 0.06 },
+    roundedRectRadii = { xRadius = 6, yRadius = 6 },
+    frame = { x = BANNER_W - xSize - xPad, y = xPad, w = xSize, h = xSize },
+  }
+  canvas[#canvas + 1] = {
+    type = "text",
+    text = hs.styledtext.new("✕", {
+      color = { white = 1, alpha = 0.7 },
+      font = { name = ".AppleSystemUIFont", size = 14 },
+      paragraphStyle = { alignment = "center" },
+    }),
+    frame = { x = BANNER_W - xSize - xPad, y = xPad + 3, w = xSize, h = xSize },
+  }
+
   local entry = { canvas = canvas, sid = sid }
-  canvas:mouseCallback(function(_, event)
+  canvas:mouseCallback(function(_, event, _, x, y)
     if event == "mouseUp" then
+      -- Click on X button → dismiss only
+      local inX = x >= (BANNER_W - xSize - xPad) and y <= (xPad + xSize)
+      if inX then
+        if sid then ackSid(sid) end
+        dismissBanner(entry)
+        return
+      end
+      -- Click elsewhere → ack + open dashboard
       if sid then
         ackSid(sid)
         hs.http.asyncPost(
@@ -486,7 +514,7 @@ renderMenubar = function(data)
   elseif fresh > 0 then
     color = { red = 0.18, green = 0.86, blue = 0.46 } -- vivid green
   elseif running > 0 then
-    color = { red = 1.0, green = 0.55, blue = 0.18 } -- warm orange
+    color = { red = 0.85, green = 0.85, blue = 0.85 } -- white/silver — running
   else
     color = { red = 0.95, green = 0.85, blue = 0.62 } -- warm cream — readable in dark menu bar
   end

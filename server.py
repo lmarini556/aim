@@ -12,6 +12,7 @@ import pathlib
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -685,6 +686,12 @@ def gather_instances() -> list[dict]:
             mcps = load_mcps(cwd, command)
             status, notif = resolve_status(hook_state, alive, tail)
             subagents = _subagent_info(sid, cwd) if alive else []
+            # Subagent activity (Explore, Thinking, etc.) keeps the parent running
+            # even when the parent's own hooks/JSONL go stale.
+            if status == "idle" and alive and subagents:
+                newest_sub = max(a.get("mtime", 0) for a in subagents)
+                if time.time() - newest_sub < RUNNING_STALENESS:
+                    status = "running"
             by_session[sid] = {
                 "session_id": sid,
                 "pid": pid,
@@ -794,6 +801,9 @@ class KillBody(BaseModel):
 _INSTANCES_CACHE: dict = {"at": 0.0, "data": []}
 _INSTANCES_TTL = 1.5
 
+_PENDING_FOCUS: dict = {"sid": None, "ts": 0.0}
+_PENDING_FOCUS_TTL = 10.0
+
 
 def cached_instances() -> list[dict]:
     now = time.time()
@@ -807,11 +817,21 @@ def cached_instances() -> list[dict]:
 
 @app.get("/api/instances")
 def api_instances() -> dict:
+    now = time.time()
+    pf = _PENDING_FOCUS
+    focus_sid = pf["sid"] if (pf["sid"] and now - pf["ts"] < _PENDING_FOCUS_TTL) else None
     return {
         "instances": cached_instances(),
-        "served_at": time.time(),
+        "served_at": now,
         "server_start": SERVER_START,
+        "pending_focus": focus_sid,
     }
+
+
+@app.delete("/api/pending-focus")
+def api_clear_pending_focus() -> dict:
+    _PENDING_FOCUS["sid"] = None
+    return {"ok": True}
 
 
 @app.get("/api/groups")
@@ -876,10 +896,12 @@ class NewInstanceBody(BaseModel):
     mcps: list[str] | None = None  # None = use claude defaults, [] = none, [...] = subset
     mcp_source: str | None = None  # path to mcp.json to pull definitions from
     name: str | None = None  # optional custom display name
+    group: str | None = None  # optional group assignment
 
 
 MCP_CONFIG_DIR = APP_DIR / "mcp-configs"
 PENDING_NAMES_FILE = APP_DIR / "pending_names.json"
+PENDING_GROUPS_FILE = APP_DIR / "pending_groups.json"
 
 
 def _pending_name_for(our_sid: str) -> str | None:
@@ -892,6 +914,12 @@ def _stash_pending_name(our_sid: str, name: str) -> None:
     data = read_json(PENDING_NAMES_FILE)
     data[our_sid] = name
     write_json(PENDING_NAMES_FILE, data)
+
+
+def _stash_pending_group(our_sid: str, group: str) -> None:
+    data = read_json(PENDING_GROUPS_FILE)
+    data[our_sid] = group
+    write_json(PENDING_GROUPS_FILE, data)
 
 
 def _promote_pending_names_for(instances: list[dict]) -> None:
@@ -914,6 +942,28 @@ def _promote_pending_names_for(instances: list[dict]) -> None:
         write_json(NAMES_FILE, names)
     if pending_changed:
         write_json(PENDING_NAMES_FILE, pending)
+
+    pending_groups = read_json(PENDING_GROUPS_FILE)
+    if not pending_groups:
+        return
+    groups = read_json(GROUPS_FILE)
+    g_changed = False
+    pg_changed = False
+    for inst in instances:
+        osid = inst.get("our_sid")
+        sid = inst.get("session_id")
+        if osid and osid in pending_groups and sid:
+            grp = pending_groups.pop(osid)
+            pg_changed = True
+            if grp not in groups:
+                groups[grp] = []
+            if sid not in groups[grp]:
+                groups[grp].append(sid)
+                g_changed = True
+    if g_changed:
+        write_json(GROUPS_FILE, groups)
+    if pg_changed:
+        write_json(PENDING_GROUPS_FILE, pending_groups)
 
 
 @app.get("/api/available-mcps")
@@ -988,13 +1038,16 @@ def api_new_instance(body: NewInstanceBody) -> dict:
         subset = {n: all_defs[n] for n in body.mcps if n in all_defs}
         cfg_path = MCP_CONFIG_DIR / f"{cfg_token}.json"
         write_json(cfg_path, {"mcpServers": subset})
-        command = f"{command} --mcp-config {shlex.quote(str(cfg_path))} --strict-mcp-config"
+        strict = "" if "--resume" in body.command else " --strict-mcp-config"
+        command = f"{command} --mcp-config {shlex.quote(str(cfg_path))}{strict}"
     try:
         our_sid = tmux_backend.spawn(str(cwd_path), command)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     if body.name and body.name.strip():
         _stash_pending_name(our_sid, body.name.strip())
+    if body.group and body.group.strip():
+        _stash_pending_group(our_sid, body.group.strip())
     # Invalidate cache so new session appears on next poll
     _INSTANCES_CACHE["at"] = 0
     return {"ok": True, "our_sid": our_sid}
@@ -1606,25 +1659,27 @@ class OpenDashboardBody(BaseModel):
 @app.post("/api/open-dashboard")
 def api_open_dashboard(body: OpenDashboardBody | None = None) -> dict:
     sid = body.sid if body else None
-    base = f"{PUBLIC_BASE_URL}/"
-    query: list[str] = []
     if sid:
-        query.append(f"sid={sid}")
-    focus_url = base + (("?" + "&".join(query)) if query else "")
-    # For first-time-open fallback, append the token so a fresh tab auth's
-    # without needing a manual /auth visit.
-    open_query = query + [f"t={AUTH_TOKEN}"]
-    open_url = base + "?" + "&".join(open_query)
+        _PENDING_FOCUS["sid"] = sid
+        _PENDING_FOCUS["ts"] = time.time()
 
     host_filter = f"{HOST}:{PORT}"
-    # Try to focus an existing authenticated tab first.
-    if _try_focus_existing(host_filter, focus_url):
+    # Try to focus the existing browser window without navigating (no reload).
+    focused_app = _try_focus_existing_window(host_filter)
+    if focused_app:
+        subprocess.Popen(["open", "-a", focused_app])
         return {"ok": True, "result": "focused"}
+    # No existing tab — open a fresh one with auth token.
+    open_query = [f"t={AUTH_TOKEN}"]
+    if sid:
+        open_query.append(f"sid={sid}")
+    open_url = f"{PUBLIC_BASE_URL}/?" + "&".join(open_query)
     subprocess.Popen(["open", open_url])
     return {"ok": True, "result": "opened"}
 
 
-def _try_focus_existing(host_filter: str, target_url: str) -> bool:
+def _try_focus_existing_window(host_filter: str) -> str | None:
+    """Activate the browser window that has an AIM tab. Returns app name or None."""
     def run(script: str) -> str:
         try:
             r = subprocess.run(
@@ -1646,7 +1701,6 @@ def _try_focus_existing(host_filter: str, target_url: str) -> bool:
                   set i to i + 1
                   try
                     if (URL of t as string) contains "{host_filter}" then
-                      set URL of t to "{target_url}"
                       set active tab index of w to i
                       set index of w to 1
                       activate
@@ -1661,16 +1715,15 @@ def _try_focus_existing(host_filter: str, target_url: str) -> bool:
         return "nf"
         '''
         if run(script) == "focused":
-            return True
+            return app
 
-    safari = f'''
+    safari_script = f'''
     if application "Safari" is running then
       tell application "Safari"
         repeat with w in windows
           repeat with t in tabs of w
             try
               if (URL of t as string) contains "{host_filter}" then
-                set URL of t to "{target_url}"
                 set current tab of w to t
                 set index of w to 1
                 activate
@@ -1683,7 +1736,9 @@ def _try_focus_existing(host_filter: str, target_url: str) -> bool:
     end if
     return "nf"
     '''
-    return run(safari) == "focused"
+    if run(safari_script) == "focused":
+        return "Safari"
+    return None
 
 
 @app.get("/api/instances/{session_id}/transcript")
@@ -1872,6 +1927,73 @@ class NoCacheStaticMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
         return response
+
+
+SETTINGS_FILE = APP_DIR / "settings.json"
+HS_SOURCE = pathlib.Path(__file__).parent / "menubar" / "claude_instances.lua"
+HS_TARGET = HOME / ".hammerspoon" / "claude_instances.lua"
+HS_INIT = HOME / ".hammerspoon" / "init.lua"
+
+
+@app.get("/api/settings")
+def api_get_settings() -> dict:
+    defaults = {"sound": True, "banner_ttl": 30, "poll_interval": 2}
+    saved = read_json(SETTINGS_FILE)
+    defaults.update(saved)
+    hs_installed = HS_TARGET.exists()
+    hs_running = False
+    try:
+        r = subprocess.run(
+            ["pgrep", "-x", "Hammerspoon"],
+            capture_output=True, timeout=2,
+        )
+        hs_running = r.returncode == 0
+    except Exception:
+        pass
+    defaults["hs_installed"] = hs_installed
+    defaults["hs_running"] = hs_running
+    return defaults
+
+
+class SettingsBody(BaseModel):
+    sound: bool = True
+    banner_ttl: int = 30
+    poll_interval: int = 2
+
+
+@app.put("/api/settings")
+def api_put_settings(body: SettingsBody) -> dict:
+    write_json(SETTINGS_FILE, body.model_dump())
+    return {"ok": True}
+
+
+@app.post("/api/settings/install-hammerspoon")
+def api_install_hammerspoon() -> dict:
+    if not HS_SOURCE.exists():
+        raise HTTPException(status_code=404, detail="claude_instances.lua not found in repo")
+    HS_TARGET.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(HS_SOURCE, HS_TARGET)
+    if HS_INIT.exists():
+        content = HS_INIT.read_text()
+    else:
+        content = ""
+    req_line = 'require("claude_instances")'
+    if req_line not in content:
+        with HS_INIT.open("a") as f:
+            f.write(f"\n{req_line}\n")
+    return {"ok": True}
+
+
+@app.post("/api/settings/reload-hammerspoon")
+def api_reload_hammerspoon() -> dict:
+    try:
+        subprocess.run(
+            ["open", "-g", "hammerspoon://reload"],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 app.add_middleware(NoCacheStaticMiddleware)
