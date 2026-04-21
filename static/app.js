@@ -417,7 +417,8 @@ function toast(msg, opts = {}) {
   t.classList.toggle("error", !!opts.error);
   t.classList.add("show");
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.remove("show"), 2800);
+  const duration = opts.persistent ? 7000 : 2800;
+  t._timer = setTimeout(() => t.classList.remove("show"), duration);
 }
 
 function escapeHtml(s) {
@@ -1493,12 +1494,25 @@ let _pendingSidFromUrl = (() => {
     return null;
   }
 })();
+const _prevStatuses = new Map();
 async function refresh() {
   if (_refreshing) return;
   _refreshing = true;
   try {
     const resp = await api("GET", "/api/instances");
     const { instances, served_at, pending_focus } = resp;
+    for (const inst of instances) {
+      const prev = _prevStatuses.get(inst.session_id);
+      if (prev && prev !== inst.status && inst.status === "needs_input") {
+        const label = inst.custom_name || inst.title || inst.name;
+        const msg = inst.notification_message || "needs input";
+        toast(`${label} — ${msg}`, { persistent: true });
+      }
+      _prevStatuses.set(inst.session_id, inst.status);
+    }
+    for (const sid of [..._prevStatuses.keys()]) {
+      if (!instances.some((i) => i.session_id === sid)) _prevStatuses.delete(sid);
+    }
     state.instances = instances;
     $("#updated").textContent = `updated ${new Date(served_at * 1000).toLocaleTimeString()}`;
     renderNav();

@@ -1,25 +1,36 @@
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-const ICON_IDLE: &[u8] = include_bytes!("../../icons/tray-idle.png");
-const ICON_RUNNING: &[u8] = include_bytes!("../../icons/tray-running.png");
-const ICON_NEEDS_INPUT: &[u8] = include_bytes!("../../icons/tray-needs-input.png");
-const ICON_FRESH: &[u8] = include_bytes!("../../icons/tray-fresh.png");
-const ICON_UNREACHABLE: &[u8] = include_bytes!("../../icons/tray-unreachable.png");
+const ICONS: [&[u8]; 8] = [
+    include_bytes!("../../icons/tray-0.png"),
+    include_bytes!("../../icons/tray-1.png"),
+    include_bytes!("../../icons/tray-2.png"),
+    include_bytes!("../../icons/tray-3.png"),
+    include_bytes!("../../icons/tray-4.png"),
+    include_bytes!("../../icons/tray-5.png"),
+    include_bytes!("../../icons/tray-6.png"),
+    include_bytes!("../../icons/tray-7.png"),
+];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayState {
-    Idle,
-    Running,
-    NeedsInput,
-    Fresh,
-    Unreachable,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TraySlots {
+    pub any_running: bool,
+    pub any_needs_input: bool,
+    pub any_idle: bool,
+}
+
+impl TraySlots {
+    fn mask(self) -> usize {
+        (self.any_running as usize)
+            | ((self.any_needs_input as usize) << 1)
+            | ((self.any_idle as usize) << 2)
+    }
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
-    let icon = tauri::image::Image::from_bytes(ICON_IDLE)?;
+    let icon = tauri::image::Image::from_bytes(ICONS[0])?;
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("main")
         .icon(icon)
         .icon_as_template(false)
         .tooltip("AIM")
@@ -46,19 +57,14 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-pub fn set_state(app: &AppHandle, state: TrayState, tooltip: &str) {
-    let bytes = match state {
-        TrayState::Idle => ICON_IDLE,
-        TrayState::Running => ICON_RUNNING,
-        TrayState::NeedsInput => ICON_NEEDS_INPUT,
-        TrayState::Fresh => ICON_FRESH,
-        TrayState::Unreachable => ICON_UNREACHABLE,
-    };
+pub fn set_state(app: &AppHandle, slots: TraySlots, tooltip: &str) {
+    let bytes = ICONS[slots.mask()];
 
-    if let Ok(icon) = tauri::image::Image::from_bytes(bytes) {
-        if let Some(tray) = app.tray_by_id("main") {
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Ok(icon) = tauri::image::Image::from_bytes(bytes) {
             let _ = tray.set_icon(Some(icon));
-            let _ = tray.set_tooltip(Some(tooltip));
         }
+        let _ = tray.set_title::<&str>(None);
+        let _ = tray.set_tooltip(Some(tooltip));
     }
 }

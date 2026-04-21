@@ -536,6 +536,9 @@ fn gather_instances(tmux_config: &TmuxConfig, ps_cache: &Mutex<PsCache>) -> Vec<
                         None => continue,
                     };
                     let tmux_name = tmux_by_sid.get(&our_sid).cloned();
+                    if tmux_name.is_none() {
+                        continue;
+                    }
                     let cwd = data.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let cwd_ref = cwd.as_deref();
                     let (jsonl_title, first_user) = session_title(&sid, cwd_ref);

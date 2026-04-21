@@ -28,14 +28,17 @@ pub async fn run(
             *counts.entry(inst.status.as_str()).or_default() += 1;
         }
 
-        let tray_state = if counts.get("needs_input").copied().unwrap_or(0) > 0 {
-            tray::TrayState::NeedsInput
-        } else if counts.get("running").copied().unwrap_or(0) > 0 {
-            tray::TrayState::Running
-        } else if instances.is_empty() {
-            tray::TrayState::Unreachable
-        } else {
-            tray::TrayState::Idle
+        let needs_input = counts.get("needs_input").copied().unwrap_or(0);
+        let running = counts.get("running").copied().unwrap_or(0);
+        let unacked_reply = instances.iter().any(|i| {
+            i.status == "idle"
+                && i.hook_timestamp.unwrap_or(0.0) > i.ack_timestamp
+        });
+
+        let slots = tray::TraySlots {
+            any_running: running > 0,
+            any_needs_input: needs_input > 0,
+            any_idle: unacked_reply,
         };
 
         let mut tooltip_parts: Vec<String> = Vec::new();
@@ -48,7 +51,7 @@ pub async fn run(
             tooltip_parts.join(" · ")
         };
 
-        tray::set_state(&app, tray_state, &tooltip);
+        tray::set_state(&app, slots, &tooltip);
 
         let settings = crate::server::instances::read_json(&crate::paths::SETTINGS_FILE);
         let sound_enabled = settings
@@ -67,11 +70,12 @@ pub async fn run(
                 if let Some(old) = old {
                     match (old.status.as_str(), inst.status.as_str()) {
                         (_, "needs_input") => {
-                            let title = inst
+                            let name = inst
                                 .custom_name
                                 .as_deref()
                                 .or(inst.title.as_deref())
                                 .unwrap_or(&inst.name);
+                            let title = format!("🟠 {name}");
                             let body = inst
                                 .notification_message
                                 .as_deref()
@@ -84,12 +88,19 @@ pub async fn run(
                                     .unwrap_or_default()
                                     .as_secs_f64();
                             }
-                            notifications::send(&app, title, body, Some(sid));
+                            notifications::send(&app, &title, body, Some(sid));
                             if sound_enabled {
                                 sound::play_glass();
                             }
                         }
                         (_, "idle") if old.status == "running" => {
+                            let name = inst
+                                .custom_name
+                                .as_deref()
+                                .or(inst.title.as_deref())
+                                .unwrap_or(&inst.name);
+                            let title = format!("🟢 {name}");
+                            notifications::send(&app, &title, "Reply finished", Some(sid));
                             if sound_enabled {
                                 sound::play_funk();
                             }
