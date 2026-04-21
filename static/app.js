@@ -1156,7 +1156,7 @@ async function removeFromAnyGroup(sid) {
     if (!groups[g].length) delete groups[g];
   }
   if (touched) {
-    await api("PUT", "/api/groups", groups);
+    await api("POST", "/api/groups", groups);
     refresh();
   }
 }
@@ -1178,7 +1178,7 @@ async function mergeIntoGroup(sourceSid, targetSid) {
 
   if (targetGroup) {
     if (!groups[targetGroup].includes(sourceSid)) groups[targetGroup].push(sourceSid);
-    await api("PUT", "/api/groups", groups);
+    await api("POST", "/api/groups", groups);
     refresh();
     return;
   }
@@ -1188,7 +1188,7 @@ async function mergeIntoGroup(sourceSid, targetSid) {
   let n = 1;
   while (groups[name]) { n += 1; name = `${baseName} ${n}`; }
   groups[name] = [sourceSid, targetSid];
-  await api("PUT", "/api/groups", groups);
+  await api("POST", "/api/groups", groups);
   await refresh();
   flashRenameGroup(name);
 }
@@ -1201,7 +1201,7 @@ async function addSessionToGroup(sid, groupName) {
   }
   groups[groupName] = groups[groupName] || [];
   if (!groups[groupName].includes(sid)) groups[groupName].push(sid);
-  await api("PUT", "/api/groups", groups);
+  await api("POST", "/api/groups", groups);
   refresh();
 }
 
@@ -1215,7 +1215,7 @@ async function renameGroup(oldName, newName) {
     groups[newName] = groups[oldName] || [];
   }
   delete groups[oldName];
-  await api("PUT", "/api/groups", groups);
+  await api("POST", "/api/groups", groups);
   refresh();
 }
 
@@ -1314,7 +1314,7 @@ function renderGroupNav() {
       if (!(await confirmDialog(`Delete group "${g}"?`, { okText: "Delete", danger: true }))) return;
       const data = await api("GET", "/api/groups");
       delete data[g];
-      await api("PUT", "/api/groups", data);
+      await api("POST", "/api/groups", data);
       if (state.groupFilter === g) state.groupFilter = null;
       refresh();
     });
@@ -1459,8 +1459,8 @@ async function showEditModal(session) {
 
   $(".save-only", bd).addEventListener("click", async () => {
     try {
-      await api("PUT", `/api/instances/${session.session_id}/name`, { name: nameI.value.trim() });
-      await api("PUT", `/api/instances/${session.session_id}/group`, { group: groupI.value.trim() || null });
+      await api("POST", `/api/instances/${session.session_id}/rename`, { name: nameI.value.trim() });
+      await api("POST", `/api/instances/${session.session_id}/group`, { group: groupI.value.trim() || null });
       toast("Saved");
       close();
       refresh();
@@ -1481,8 +1481,8 @@ async function showEditModal(session) {
         const oldSessionId = session.session_id;
         const newName = nameI.value.trim();
         const newGroup = groupI.value.trim() || null;
-        await api("PUT", `/api/instances/${oldSessionId}/name`, { name: newName });
-        await api("PUT", `/api/instances/${oldSessionId}/group`, { group: newGroup });
+        await api("POST", `/api/instances/${oldSessionId}/rename`, { name: newName });
+        await api("POST", `/api/instances/${oldSessionId}/group`, { group: newGroup });
         await api("POST", `/api/instances/${oldSessionId}/kill`).catch(() => {});
         await new Promise((r) => setTimeout(r, 600));
         const cmd = cwdChanged ? "claude" : "claude --continue";
@@ -1556,7 +1556,7 @@ function promptNewGroup() {
       data[other] = data[other].filter((s) => !ids.includes(s));
       if (!data[other].length) delete data[other];
     }
-    await api("PUT", "/api/groups", data);
+    await api("POST", "/api/groups", data);
     close();
     toast(`Created "${name}" with ${ids.length} instance${ids.length === 1 ? "" : "s"}`);
     refresh();
@@ -1612,7 +1612,7 @@ async function refresh() {
       const match = instances.find((i) => i.session_id === pending_focus);
       if (match) {
         selectInstance(match.session_id);
-        api("DELETE", "/api/pending-focus").catch(() => {});
+        api("POST", "/api/clear-pending-focus").catch(() => {});
       }
     }
     if (state.selectedSid) await loadTranscript();
