@@ -527,11 +527,11 @@ fn gather_instances(tmux_config: &TmuxConfig, ps_cache: &Mutex<PsCache>) -> Vec<
                         continue;
                     }
                     let hook_state = read_json(&paths::STATE_DIR.join(format!("{sid}.json")));
-                    let our_sid = hook_state
+                    let our_sid = match hook_state
                         .get("our_sid")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let our_sid = match our_sid {
+                        .map(|s| s.to_string())
+                    {
                         Some(s) => s,
                         None => continue,
                     };
@@ -625,8 +625,12 @@ fn gather_instances(tmux_config: &TmuxConfig, ps_cache: &Mutex<PsCache>) -> Vec<
             if tp.contains("/subagents/") {
                 continue;
             }
-            let our_sid = match data.get("our_sid").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+            let our_sid = match data
+                .get("our_sid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            {
+                Some(s) => s,
                 None => continue,
             };
             orphan_count += 1;

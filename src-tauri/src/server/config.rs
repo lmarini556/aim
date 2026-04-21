@@ -343,6 +343,67 @@ pub async fn api_config_claudemd_write(Json(body): Json<ConfigWriteBody>) -> Jso
     Json(json!({"ok": true, "path": p.to_string_lossy()}))
 }
 
+fn expand_tilde(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        paths::HOME.join(rest)
+    } else if raw == "~" {
+        paths::HOME.clone()
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+fn servers_from_value(data: &Value) -> Vec<String> {
+    data.get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+pub async fn api_mcp_list(Json(body): Json<McpListBody>) -> Json<Value> {
+    let p = expand_tilde(body.path.trim());
+    if !p.is_file() {
+        return Json(json!({
+            "path": p.to_string_lossy(),
+            "exists": false,
+            "mcps": Vec::<String>::new(),
+        }));
+    }
+    let data = read_json_safe(&p);
+    let mut mcps = servers_from_value(&data);
+    mcps.sort();
+    Json(json!({
+        "path": p.to_string_lossy(),
+        "exists": true,
+        "mcps": mcps,
+    }))
+}
+
+pub async fn api_mcp_sources() -> Json<Value> {
+    let candidates: &[(&str, PathBuf)] = &[
+        ("~/.claude.json", paths::HOME.join(".claude.json")),
+        ("~/.claude/mcp.json", paths::GLOBAL_MCP.clone()),
+    ];
+    let sources: Vec<Value> = candidates
+        .iter()
+        .map(|(label, p)| {
+            let exists = p.is_file();
+            let count = if exists {
+                Some(servers_from_value(&read_json_safe(p)).len())
+            } else {
+                None
+            };
+            json!({
+                "path": label,
+                "label": label,
+                "exists": exists,
+                "count": count,
+            })
+        })
+        .collect();
+    Json(json!({ "sources": sources }))
+}
+
 fn extract_mcp_config_path(cmd: &str) -> Option<String> {
     let idx = cmd.find("--mcp-config")?;
     let rest = &cmd[idx + "--mcp-config".len()..];

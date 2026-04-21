@@ -59,10 +59,16 @@ pub fn tmux_spawn_session(
     }
 
     let output = cmd.output()?;
-
-    Ok(TmuxOutput {
+    let out = TmuxOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         success: output.status.success(),
-    })
+    };
+    if !out.success {
+        return Err(CiuError::TmuxCommand {
+            cmd: args.join(" "),
+            stderr: out.stderr,
+        });
+    }
+    Ok(out)
 }

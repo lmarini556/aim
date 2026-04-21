@@ -22,7 +22,9 @@ use tower_http::set_header::SetResponseHeaderLayer;
 pub fn build_router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/api/instances", get(instances::api_instances))
-        .route("/api/instances", post(instances::api_new_instance))
+        .route("/api/instances/new", post(instances::api_new_instance))
+        .route("/api/mcp-list", post(config::api_mcp_list))
+        .route("/api/mcp-sources", get(config::api_mcp_sources))
         .route(
             "/api/instances/{session_id}/rename",
             post(instances::api_rename),
@@ -107,7 +109,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     let ws_routes = Router::new()
         .route(
-            "/ws/terminal/{session_id}",
+            "/ws/instances/{session_id}/terminal",
             get(terminal::ws_terminal),
         )
         .with_state(state.clone());
@@ -168,10 +170,7 @@ async fn index_handler(
         .unwrap_or("");
 
     if !token_param.is_empty() && auth::constant_time_eq(token_param, &state.auth_token) {
-        let index_path = paths::STATIC_DIR.join("index.html");
-        let body = std::fs::read_to_string(&index_path).unwrap_or_else(|_| {
-            "<h1>index.html not found</h1>".to_string()
-        });
+        let body = render_index(&state.auth_token);
         let cookie = format!(
             "{}={}; HttpOnly; SameSite=Lax; Max-Age=31536000; Path=/",
             COOKIE_NAME, state.auth_token
@@ -186,10 +185,7 @@ async fn index_handler(
     let cookie_token = extract_cookie_token(&req);
     if let Some(ref t) = cookie_token {
         if auth::constant_time_eq(t, &state.auth_token) {
-            let index_path = paths::STATIC_DIR.join("index.html");
-            let body = std::fs::read_to_string(&index_path).unwrap_or_else(|_| {
-                "<h1>index.html not found</h1>".to_string()
-            });
+            let body = render_index(&state.auth_token);
             return ([(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())], body)
                 .into_response();
         }
@@ -246,6 +242,22 @@ async fn auth_handler(
         ],
     )
         .into_response()
+}
+
+fn render_index(token: &str) -> String {
+    let index_path = paths::STATIC_DIR.join("index.html");
+    let html = std::fs::read_to_string(&index_path)
+        .unwrap_or_else(|_| "<h1>index.html not found</h1>".to_string());
+    let escaped = token.replace('\\', r"\\").replace('\'', r"\'");
+    let inject = format!(
+        "<script>try{{sessionStorage.setItem('ciu_token','{escaped}')}}catch(e){{}}</script>"
+    );
+    if let Some(idx) = html.find("</head>") {
+        let (head, tail) = html.split_at(idx);
+        format!("{head}{inject}{tail}")
+    } else {
+        format!("{inject}{html}")
+    }
 }
 
 fn extract_cookie_token(req: &Request) -> Option<String> {
