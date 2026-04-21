@@ -105,6 +105,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/debug/capture/{session_id}",
             get(api_debug_capture),
         )
+        .route("/api/clipboard", get(api_read_clipboard))
+        .route("/api/clipboard", post(api_write_clipboard))
         .with_state(state.clone());
 
     let ws_routes = Router::new()
@@ -269,6 +271,35 @@ fn extract_cookie_token(req: &Request) -> Option<String> {
         }
     }
     None
+}
+
+async fn api_read_clipboard() -> axum::Json<serde_json::Value> {
+    let text = tokio::task::spawn_blocking(|| {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.get_text())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    axum::Json(serde_json::json!({"text": text}))
+}
+
+async fn api_write_clipboard(
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ok = tokio::task::spawn_blocking(move || {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text))
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    axum::Json(serde_json::json!({"ok": ok}))
 }
 
 async fn api_debug_capture(

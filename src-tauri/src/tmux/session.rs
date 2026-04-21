@@ -58,6 +58,42 @@ pub fn ensure_global_keys(config: &TmuxConfig) {
                 "[13;2u",
             ],
         );
+
+        // Right-click opens a persistent context menu on *release* (not press),
+        // so it doesn't auto-dismiss like tmux's default MouseDown3 popup.
+        let _ = tmux_run(&config, &["unbind-key", "-T", "root", "MouseDown3Pane"]);
+        let _ = tmux_run(&config, &["unbind-key", "-T", "root", "MouseUp3Pane"]);
+        let _ = tmux_run(
+            &config,
+            &[
+                "bind-key", "-T", "root", "MouseUp3Pane",
+                "display-menu", "-O", "-t", "=", "-x", "M", "-y", "M",
+                "Copy", "c", "send-keys -X copy-pipe-no-clear pbcopy",
+                "Paste", "v", "paste-buffer -p",
+                "", "", "",
+                "Clear history", "C", "clear-history",
+            ],
+        );
+
+        for table in ["copy-mode", "copy-mode-vi"] {
+            // Drag-end: copy to macOS clipboard but keep the highlight.
+            let _ = tmux_run(
+                &config,
+                &[
+                    "bind-key", "-T", table, "MouseDragEnd1Pane",
+                    "send-keys", "-X", "copy-pipe-no-clear", "pbcopy",
+                ],
+            );
+            // Plain left-click exits copy-mode so the selection clears
+            // without needing to reach for Escape.
+            let _ = tmux_run(
+                &config,
+                &[
+                    "bind-key", "-T", table, "MouseDown1Pane",
+                    "send-keys", "-X", "cancel",
+                ],
+            );
+        }
     });
 }
 

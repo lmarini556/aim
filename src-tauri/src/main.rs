@@ -84,6 +84,8 @@ async fn main() {
         name_prefix: "ciu-".to_string(),
     };
 
+    aim_lib::tmux::session::ensure_global_keys(&tmux_config);
+
     let state = Arc::new(AppState {
         tmux_config: tmux_config.clone(),
         auth_token: token.clone(),
@@ -181,6 +183,8 @@ async fn main() {
                 let url = format!("http://127.0.0.1:{port}/?t={token}");
                 let _ = win.eval(&format!("window.location.replace('{url}')"));
                 let _ = win.show();
+                #[cfg(target_os = "macos")]
+                aim_lib::native::webview_menu::disable_context_menu(&win);
             }
 
             Ok(())

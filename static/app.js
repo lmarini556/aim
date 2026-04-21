@@ -239,19 +239,19 @@ const xtermManager = (() => {
 
     term = new window.Terminal({
       fontFamily: `"SF Mono", Menlo, Monaco, "Cascadia Mono", Consolas, "Liberation Mono", monospace`,
-      fontSize: 13,
+      fontSize: termFontSize(),
       fontWeight: 400,
       fontWeightBold: 700,
       lineHeight: 1.2,
       letterSpacing: 0,
-      cursorBlink: true,
+      cursorBlink: false,
       cursorStyle: "block",
       cursorWidth: 1,
       allowProposedApi: true,
       scrollback: 8000,
       convertEol: false,
       macOptionIsMeta: true,
-      rightClickSelectsWord: true,
+      rightClickSelectsWord: false,
       drawBoldTextInBrightColors: false,
       minimumContrastRatio: 1,
       // customGlyphs: true (xterm default) — lets xterm render box-drawing
@@ -274,6 +274,24 @@ const xtermManager = (() => {
         ev.stopPropagation();
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "input", data: "\x1b[13;2u" }));
+        }
+        return;
+      }
+      if (ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
+        const k = ev.key.toLowerCase();
+        if (k === "c") {
+          // Selection is already on the macOS clipboard via tmux's
+          // copy-pipe-no-clear → pbcopy binding. Swallow the shortcut so
+          // macOS doesn't beep.
+          ev.preventDefault();
+          ev.stopPropagation();
+          return;
+        }
+        if (k === "v") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          xtermManager.paste();
+          return;
         }
       }
     }, true);
@@ -395,7 +413,47 @@ const xtermManager = (() => {
 
   const focus = () => { if (term) term.focus(); };
 
-  return { attach, detach: dispose, writeText, focus, fit: fitNow, get sid() { return sid; } };
+  const paste = async () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn("[paste] WS not open");
+      return;
+    }
+    let text = "";
+    try {
+      const data = await api("GET", "/api/clipboard");
+      text = typeof data.text === "string" ? data.text : "";
+    } catch (e) {
+      try {
+        text = await navigator.clipboard.readText();
+      } catch (e2) {
+        console.warn("[paste] clipboard read failed:", e, e2);
+        if (typeof toast === "function") toast("Paste failed", { error: true });
+        return;
+      }
+    }
+    if (text) ws.send(JSON.stringify({ type: "input", data: text }));
+  };
+
+  const setFontSize = (px) => {
+    if (!term) return;
+    try {
+      term.options.fontSize = px;
+      fitNow();
+      sendResize();
+    } catch {}
+  };
+
+  const getSelection = () => {
+    if (!term) return "";
+    try { return term.getSelection() || ""; } catch { return ""; }
+  };
+
+  const clearSelection = () => {
+    if (!term) return;
+    try { term.clearSelection(); } catch {}
+  };
+
+  return { attach, detach: dispose, writeText, focus, paste, fit: fitNow, setFontSize, getSelection, clearSelection, get sid() { return sid; } };
 })();
 
 async function api(method, url, body) {
@@ -419,6 +477,33 @@ function toast(msg, opts = {}) {
   clearTimeout(t._timer);
   const duration = opts.persistent ? 7000 : 2800;
   t._timer = setTimeout(() => t.classList.remove("show"), duration);
+}
+
+function confirmDialog(message, { okText = "OK", cancelText = "Cancel", danger = false } = {}) {
+  return new Promise((resolve) => {
+    const bd = document.createElement("div");
+    bd.className = "modal-backdrop confirm-modal";
+    const lines = String(message).split("\n").map((l) => `<div>${escapeHtml(l)}</div>`).join("");
+    bd.innerHTML = `
+      <div class="modal-card confirm-card">
+        <div class="confirm-msg">${lines}</div>
+        <div class="modal-actions">
+          <button class="modal-btn cancel">${escapeHtml(cancelText)}</button>
+          <button class="modal-btn primary ok${danger ? " danger" : ""}">${escapeHtml(okText)}</button>
+        </div>
+      </div>`;
+    document.body.append(bd);
+    const done = (v) => { bd.remove(); document.removeEventListener("keydown", onKey, true); resolve(v); };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); done(false); }
+      else if (e.key === "Enter") { e.stopPropagation(); done(true); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    $(".cancel", bd).addEventListener("click", () => done(false));
+    $(".ok", bd).addEventListener("click", () => done(true));
+    bd.addEventListener("click", (e) => { if (e.target === bd) done(false); });
+    setTimeout(() => $(".ok", bd)?.focus(), 0);
+  });
 }
 
 function escapeHtml(s) {
@@ -822,7 +907,7 @@ function wirePreviewActions(shell) {
   $(".ph-stop", shell).addEventListener("click", async () => {
     const s = sess(); if (!s) return;
     const label = s.custom_name || s.name;
-    if (!confirm(`Stop "${label}"? This kills the process.`)) return;
+    if (!(await confirmDialog(`Stop "${label}"?\nThis kills the process.`, { okText: "Stop", danger: true }))) return;
     try {
       await api("POST", `/api/instances/${s.session_id}/kill`);
       toast("Stopped");
@@ -1203,8 +1288,8 @@ function renderGroupNav() {
   groupNav.innerHTML = "";
   if (!groups.length) {
     const empty = document.createElement("div");
+    empty.className = "group-nav-empty";
     empty.textContent = "No groups · click ＋";
-    empty.style.cssText = "font-size:11px;color:var(--muted);padding:4px 10px";
     groupNav.append(empty);
     return;
   }
@@ -1226,7 +1311,7 @@ function renderGroupNav() {
     });
     $(".group-del", row).addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (!confirm(`Delete group "${g}"?`)) return;
+      if (!(await confirmDialog(`Delete group "${g}"?`, { okText: "Delete", danger: true }))) return;
       const data = await api("GET", "/api/groups");
       delete data[g];
       await api("PUT", "/api/groups", data);
@@ -1391,7 +1476,7 @@ async function showEditModal(session) {
       if (!newCwd) { cwdI.focus(); return; }
       const cwdChanged = newCwd !== (session.cwd || "");
       const resumeNote = cwdChanged ? "Fresh session (CWD changed)." : "Conversation will be continued.";
-      if (!confirm(`Restart with new config?\n${resumeNote}`)) return;
+      if (!(await confirmDialog(`Restart with new config?\n${resumeNote}`, { okText: "Restart" }))) return;
       try {
         const oldSessionId = session.session_id;
         const newName = nameI.value.trim();
@@ -1414,15 +1499,15 @@ async function showEditModal(session) {
         const res = await api("POST", "/api/instances/new", payload);
         close();
         toast("Restarting…");
-        const deadline = Date.now() + 12000;
+        const deadline = Date.now() + 20000;
         const tick = async () => {
           await refresh();
-          const match = state.instances.find((i) => i.our_sid === res.our_sid);
+          const match = state.instances.find((i) => i.our_sid === res.our_sid && i.alive);
           if (match) { selectInstance(match.session_id); toast("Restarted"); return; }
-          if (Date.now() < deadline) { setTimeout(tick, 400); return; }
+          if (Date.now() < deadline) { setTimeout(tick, 300); return; }
           toast("Instance spawned but not yet visible — check the terminal", { error: true });
         };
-        tick();
+        setTimeout(tick, 400);
       } catch (e) {
         toast(`Restart failed: ${e.message}`, { error: true });
       }
@@ -1634,7 +1719,7 @@ const configEditor = (() => {
         del.title = "Delete skill";
         del.addEventListener("click", async (e) => {
           e.stopPropagation();
-          if (!confirm(`Delete "${item.name}"?`)) return;
+          if (!(await confirmDialog(`Delete "${item.name}"?`, { okText: "Delete", danger: true }))) return;
           try {
             await api("POST", "/api/config/skill/delete", { path: item.path });
             toast("Deleted");
@@ -1653,7 +1738,7 @@ const configEditor = (() => {
   }
 
   async function selectItem(item, btnEl) {
-    if (dirty && !confirm("Discard unsaved changes?")) return;
+    if (dirty && !(await confirmDialog("Discard unsaved changes?", { okText: "Discard", danger: true }))) return;
     activeItem = item;
     dirty = false;
     $$(".ce-file-item").forEach((b) => b.classList.remove("active"));
@@ -2113,11 +2198,101 @@ document.addEventListener("paste", async (e) => {
   });
 })();
 
+// Resizable instances column — drag handle on the right edge of #listCol,
+// width persisted in localStorage as --list-w CSS variable.
+(function () {
+  const listCol = document.getElementById("listCol");
+  if (!listCol) return;
+  const LIST_MIN = 240;
+  const LIST_MAX = 640;
+  const stored = parseFloat(localStorage.getItem("ciu_list_w"));
+  const initial = Number.isFinite(stored) ? Math.max(LIST_MIN, Math.min(LIST_MAX, stored)) : 320;
+  document.documentElement.style.setProperty("--list-w", `${initial}px`);
+
+  const handle = document.createElement("div");
+  handle.id = "listResizer";
+  handle.title = "Drag to resize";
+  listCol.append(handle);
+
+  let startX = 0;
+  let startW = initial;
+  const onMove = (e) => {
+    const dx = e.clientX - startX;
+    const w = Math.max(LIST_MIN, Math.min(LIST_MAX, startW + dx));
+    document.documentElement.style.setProperty("--list-w", `${w}px`);
+  };
+  const onUp = () => {
+    handle.classList.remove("dragging");
+    document.body.classList.remove("list-resizing");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    const cur = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--list-w"));
+    if (Number.isFinite(cur)) localStorage.setItem("ciu_list_w", String(cur));
+    try { xtermManager.fit(); } catch {}
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    startX = e.clientX;
+    startW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--list-w")) || 320;
+    handle.classList.add("dragging");
+    document.body.classList.add("list-resizing");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+})();
+
 $("#openFullBtn").addEventListener("click", () => {
   api("POST", "/api/open-dashboard").catch((e) => toast(e.message, { error: true }));
 });
 
+const TERM_FONT_MIN = 8;
+const TERM_FONT_MAX = 28;
+const TERM_FONT_DEFAULT = 12;
+const TERM_FONT_STEP = 1;
+function termFontSize() {
+  const stored = parseInt(localStorage.getItem("ciu_term_fontsize"), 10);
+  if (Number.isFinite(stored) && stored >= TERM_FONT_MIN && stored <= TERM_FONT_MAX) return stored;
+  return TERM_FONT_DEFAULT;
+}
+function setTermFontSize(px) {
+  const clamped = Math.max(TERM_FONT_MIN, Math.min(TERM_FONT_MAX, px));
+  localStorage.setItem("ciu_term_fontsize", String(clamped));
+  try { xtermManager.setFontSize(clamped); } catch {}
+  return clamped;
+}
+
+function isPointerInTerminal(target) {
+  const xtHost = document.getElementById("xtermHost");
+  return !!(xtHost && (xtHost === target || xtHost.contains(target)));
+}
+
+// Prevent WebKit contextmenu event from firing default behaviour inside the
+// terminal. Mouse events themselves flow through to xterm.js → tmux, which
+// renders its own popup menu and handles selection.
+window.addEventListener("contextmenu", (e) => {
+  if (isPointerInTerminal(e.target)) {
+    e.preventDefault();
+  }
+}, { capture: true });
+
 document.addEventListener("keydown", (e) => {
+  if (e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey) {
+    if (e.key === "=" || e.key === "+") {
+      e.preventDefault();
+      setTermFontSize(termFontSize() + TERM_FONT_STEP);
+      return;
+    }
+    if (e.key === "-") {
+      e.preventDefault();
+      setTermFontSize(termFontSize() - TERM_FONT_STEP);
+      return;
+    }
+    if (e.key === "0") {
+      e.preventDefault();
+      setTermFontSize(TERM_FONT_DEFAULT);
+      return;
+    }
+  }
   if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") {
     const xtHost = document.querySelector(".xterm-helper-textarea");
     if (xtHost && document.activeElement === xtHost) return; // xterm has focus → let it through

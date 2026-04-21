@@ -43,69 +43,70 @@ fn build_prompt(
     prev: Option<&str>,
     goal: Option<&str>,
     actions: &[Value],
-    last_text: Option<&str>,
+    _last_text: Option<&str>,
     new_prompts: &[String],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(
-        "You are maintaining a rolling summary of a Claude Code agent session.".to_string(),
+        "You maintain a rolling summary of a Claude Code agent session. Treat it like a \
+         stable mental model that SHIFTS GRADUALLY as the conversation accumulates — not \
+         a recap of the most recent exchange."
+            .to_string(),
+    );
+    parts.push(String::new());
+    parts.push(
+        "Rules of motion:\n\
+         1. If the new activity continues the same topic, return a summary that is 90%+ \
+            identical to the previous one, with at most minor factual additions or \
+            corrections.\n\
+         2. If the new activity adds a new subtopic that coexists with the existing one, \
+            extend the summary; do not replace.\n\
+         3. Only rewrite substantially when the topic has clearly pivoted across multiple \
+            recent exchanges — not after a single off-topic message.\n\
+         4. Never center the summary on the most recent message or reply. They are drift \
+            signals, not the subject."
+            .to_string(),
     );
     parts.push(String::new());
 
-    if let Some(prev) = prev {
-        parts.push(format!("Previous summary:\n{prev}"));
-        parts.push(String::new());
-    }
+    parts.push("Previous summary:".to_string());
+    parts.push(match prev {
+        Some(p) => p.to_string(),
+        None => "(none yet — this is the first summary)".to_string(),
+    });
+    parts.push(String::new());
+
     if !new_prompts.is_empty() {
-        parts.push("New user messages since last update:".to_string());
-        for p in new_prompts.iter().rev().take(5).rev() {
-            parts.push(format!("- {p}"));
+        parts.push("Recent user messages (drift signals — do not center on these):".to_string());
+        for p in new_prompts.iter().rev().take(3).rev() {
+            let trimmed: String = p.chars().take(200).collect();
+            parts.push(format!("- {}", trimmed.trim()));
         }
         parts.push(String::new());
+    } else if let Some(goal) = goal {
+        let trimmed: String = goal.chars().take(200).collect();
+        parts.push(format!(
+            "Latest user message (drift signal): {}",
+            trimmed.trim()
+        ));
+        parts.push(String::new());
     }
-    if let Some(goal) = goal {
-        if new_prompts.is_empty() {
-            parts.push(format!("Current task (latest user message): {goal}"));
-            parts.push(String::new());
-        }
-    }
+
     if !actions.is_empty() {
-        parts.push("Recent agent actions:".to_string());
-        for a in actions.iter().rev().take(10).rev() {
-            let tool = a
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
-            let arg = a
-                .get("arg")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if arg.is_empty() {
-                parts.push(format!("- {tool}"));
-            } else {
-                parts.push(format!("- {tool}: {arg}"));
-            }
+        parts.push("Recent tool invocations (activity signals):".to_string());
+        for a in actions.iter().rev().take(5).rev() {
+            let tool = a.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            parts.push(format!("- {tool}"));
         }
         parts.push(String::new());
     }
-    if let Some(lt) = last_text {
-        let preview: String = lt.chars().take(400).collect();
-        let preview = preview.replace('\n', " ");
-        parts.push(format!("Most recent agent reply: {}", preview.trim()));
-        parts.push(String::new());
-    }
+
     parts.push(
-        "Write ONE short paragraph (2-4 sentences) describing the session's overall purpose, \
-         progress, and current state. Prioritize what the user is ultimately trying to accomplish. \
-         Evolve naturally from the previous summary — do not reset if the topic is unchanged; \
-         do not re-describe everything from scratch. Be concrete and specific (mention files, \
-         systems, or bug symptoms when relevant). No filler, no meta-commentary about the summary.\n\n\
-         STRICT RULES:\n\
-         - NEVER ask questions or request more context.\n\
-         - NEVER say you lack information. Summarize whatever is available.\n\
-         - If very little context exists, describe what you can infer from tool names and args.\n\
-         - Output ONLY the summary paragraph — no preamble, no bullet points, no formatting."
+        "Output ONE short paragraph (2-4 sentences) that describes the session's overall \
+         purpose and current state. Be concrete (files, systems, bug symptoms) when the \
+         previous summary already mentioned them. No filler, no meta-commentary, no \
+         questions, no mention of missing information, no bullet points — just the \
+         paragraph."
             .to_string(),
     );
     parts.join("\n")
@@ -330,7 +331,7 @@ async fn process_request(session_id: &str, ctx: &Value) {
         .unwrap_or_default();
     let last_text = ctx.get("last_text").and_then(Value::as_str);
     let new_prompts: Vec<String> = ctx
-        .get("new_prompts")
+        .get("recent_prompts")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()

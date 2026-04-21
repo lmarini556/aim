@@ -7,20 +7,13 @@
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23ff6b1a'/><text x='32' y='43' text-anchor='middle' font-family='monospace' font-size='28' font-weight='900' fill='%23000'>AIM</text></svg>" />
     <link rel="stylesheet" href="/static/vendor/inter.css" />
     <link rel="stylesheet" href="/static/vendor/xterm.min.css" />
-    <link rel="stylesheet" href="/static/style.css?v=71" />
+    <link rel="stylesheet" href="/static/style.css?v=78" />
   </head>
   <body>
     <aside id="sidebar">
+      <button id="sidebarToggle" class="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">‹</button>
       <div class="brand">
         <span class="brand-name">A<span class="brand-dot">·</span>I<span class="brand-dot">·</span>M</span>
-        <button id="sidebarToggle" class="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">‹</button>
-      </div>
-      <div class="group-list-wrap">
-        <div class="section-label">
-          <span>Groups</span>
-          <button id="newGroupBtn" title="Create group">＋</button>
-        </div>
-        <div id="groupNav"></div>
       </div>
       <div class="config-section">
         <div class="section-label"><span>Configuration</span></div>
@@ -40,6 +33,13 @@
           <span class="config-icon">⚙</span>
           <span class="config-nav-label">Settings</span>
         </button>
+      </div>
+      <div class="group-list-wrap">
+        <div class="section-label">
+          <span>Groups</span>
+          <button id="newGroupBtn" title="Create group">＋</button>
+        </div>
+        <div id="groupNav"></div>
       </div>
       <div class="foot">
         <span id="updated">—</span>
@@ -236,6 +236,6 @@
     <script src="/static/vendor/xterm-addon-webgl.min.js"></script>
     <script src="/static/vendor/xterm-addon-canvas.min.js"></script>
     <script src="/static/sprite.js?v=57"></script>
-    <script src="/static/app.js?v=73"></script>
+    <script src="/static/app.js?v=86"></script>
   </body>
 </html>
