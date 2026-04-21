@@ -1503,7 +1503,18 @@ async function showEditModal(session) {
         const tick = async () => {
           await refresh();
           const match = state.instances.find((i) => i.our_sid === res.our_sid && i.alive);
-          if (match) { selectInstance(match.session_id); toast("Restarted"); return; }
+          if (match) {
+            // `claude --continue` resumes the same session UUID, so
+            // match.session_id can equal the currently selected sid — that
+            // would make selectInstance() no-op and leave xterm bound to the
+            // dead tmux backend. Force a full detach + reattach.
+            state.renderedSid = null;
+            xtermManager.detach();
+            state.selectedSid = null;
+            selectInstance(match.session_id);
+            toast("Restarted");
+            return;
+          }
           if (Date.now() < deadline) { setTimeout(tick, 300); return; }
           toast("Instance spawned but not yet visible — check the terminal", { error: true });
         };
