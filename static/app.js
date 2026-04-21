@@ -2139,11 +2139,8 @@ function showSettingsPanel() {
     soundCb.checked = s.sound !== false;
     ttlInput.value = s.banner_ttl || 30;
     pollInput.value = s.poll_interval || 2;
-    const parts = [];
-    parts.push(s.hs_installed ? "Module installed" : "Module not installed");
-    parts.push(s.hs_running ? "Hammerspoon running" : "Hammerspoon not running");
-    status.textContent = parts.join(" · ");
-    status.className = "settings-status " + (s.hs_installed && s.hs_running ? "ok" : "warn");
+    status.textContent = "Native app — tray, notifications, and shortcuts active";
+    status.className = "settings-status ok";
   }).catch(() => {
     status.textContent = "Could not load settings";
     status.className = "settings-status warn";
@@ -2168,25 +2165,6 @@ function showSettingsPanel() {
     }
   });
 
-  bd.querySelector("#hsInstall").addEventListener("click", async () => {
-    try {
-      await api("POST", "/api/settings/install-hammerspoon");
-      toast("Module installed — reload Hammerspoon to apply");
-      status.textContent = "Module installed · reload Hammerspoon to apply";
-      status.className = "settings-status ok";
-    } catch (e) {
-      toast(`Install failed: ${e.message}`, { error: true });
-    }
-  });
-
-  bd.querySelector("#hsReload").addEventListener("click", async () => {
-    try {
-      await api("POST", "/api/settings/reload-hammerspoon");
-      toast("Reload signal sent");
-    } catch (e) {
-      toast(`Reload failed: ${e.message}`, { error: true });
-    }
-  });
 }
 
 const settingsBtn = $("#settingsHammerspoon");

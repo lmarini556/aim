@@ -5,9 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AIM — Agent Instances Manager</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23ff6b1a'/><text x='32' y='43' text-anchor='middle' font-family='monospace' font-size='28' font-weight='900' fill='%23000'>AIM</text></svg>" />
-    <link rel="preconnect" href="https://rsms.me/" />
-    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <link rel="stylesheet" href="/static/vendor/inter.css" />
+    <link rel="stylesheet" href="/static/vendor/xterm.min.css" />
     <link rel="stylesheet" href="/static/style.css?v=71" />
   </head>
   <body>
@@ -222,11 +221,6 @@
           <label class="modal-label">Poll interval (seconds)</label>
           <input class="modal-input" id="hsPollInterval" type="number" min="1" max="30" value="2" />
 
-          <div class="settings-actions">
-            <button class="modal-btn" id="hsInstall">Install / Update Module</button>
-            <button class="modal-btn" id="hsReload">Reload Hammerspoon</button>
-          </div>
-
           <div class="modal-actions">
             <button class="modal-btn cancel">Close</button>
             <button class="modal-btn primary save-settings">Save</button>
@@ -236,11 +230,11 @@
     </template>
 
     <div id="toast"></div>
-    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-canvas@0.5.0/lib/xterm-addon-canvas.min.js"></script>
+    <script src="/static/vendor/xterm.min.js"></script>
+    <script src="/static/vendor/xterm-addon-fit.min.js"></script>
+    <script src="/static/vendor/xterm-addon-web-links.min.js"></script>
+    <script src="/static/vendor/xterm-addon-webgl.min.js"></script>
+    <script src="/static/vendor/xterm-addon-canvas.min.js"></script>
     <script src="/static/sprite.js?v=57"></script>
     <script src="/static/app.js?v=73"></script>
   </body>
