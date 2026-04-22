@@ -1,6 +1,10 @@
 # Rust / Tauri
-src-tauri/target/
-src-tauri/gen/schemas/
+src/target/
+src/gen/schemas/
+
+# Frontend (Vitest)
+tests/frontend/node_modules/
+tests/frontend/coverage/
 
 # macOS
 .DS_Store

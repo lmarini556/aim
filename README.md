@@ -77,7 +77,7 @@ Requirements: Rust toolchain, Xcode command-line tools.
 
 ```bash
 git clone https://github.com/lmarini556/aim.git
-cd aim/src-tauri
+cd aim/src
 cargo tauri build
 ```
 

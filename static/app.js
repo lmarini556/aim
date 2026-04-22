@@ -1,3 +1,20 @@
+import {
+  FRESH_WINDOW_SECONDS,
+  STATUS_GLYPH,
+  STATUS_TEXT,
+  GROUP_COLORS,
+  freshIntensity as freshIntensityPure,
+  formatAnsiForLog,
+  summarizeAnsi,
+  escapeHtml,
+  relTime,
+  fmtTime,
+  truncCwd,
+  groupColor,
+  listSignature as listSignaturePure,
+  filterInstances,
+} from "./lib/pure.js";
+
 // Visible build stamp — lets us tell at a glance (console + bottom-right
 // chip) whether a refresh actually pulled the latest code. If you don't
 // see "CIU-BUILD-44" in the console AND a small orange "44" chip in the
@@ -38,9 +55,6 @@ const state = {
   pendingAcks: {},
 };
 
-const FRESH_WINDOW_SECONDS = 300;
-
-
 function acknowledge(sid, hookTs) {
   if (!sid || !hookTs) return;
   const prev = state.pendingAcks[sid] || 0;
@@ -49,20 +63,7 @@ function acknowledge(sid, hookTs) {
   api("POST", `/api/instances/${sid}/ack`, { timestamp: hookTs }).catch(() => {});
 }
 
-function freshIntensity(inst) {
-  if (!inst.alive || inst.status !== "idle") return 0;
-  if (inst.last_event !== "Stop") return 0;
-  const ts = inst.hook_timestamp;
-  if (!ts) return 0;
-  const serverAck = inst.ack_timestamp || 0;
-  const localAck = state.pendingAcks[inst.session_id] || 0;
-  const ack = Math.max(serverAck, localAck);
-  if (ts <= ack) return 0;
-  const age = Date.now() / 1000 - ts;
-  if (age < 0) return 1;
-  if (age >= FRESH_WINDOW_SECONDS) return 0;
-  return 1 - age / FRESH_WINDOW_SECONDS;
-}
+const freshIntensity = (inst) => freshIntensityPure(inst, state.pendingAcks);
 
 const $ = (q, el = document) => el.querySelector(q);
 const $$ = (q, el = document) => [...el.querySelectorAll(q)];
@@ -88,65 +89,6 @@ const AUTH_TOKEN = (() => {
 /* -------------------------------------------------------------------- */
 const XTERM_DEBUG = new URLSearchParams(location.search).get("xdebug") === "1";
 const XTERM_DEBUG_MAX_CHUNKS = 40;
-
-// Make the control bytes/escape sequences human-readable so we can spot
-// underlines (ESC[4m), 256-color bg (ESC[48;5;Nm), half-block glyphs (▀ ▄ █),
-// and other suspects that could paint horizontal bars.
-function formatAnsiForLog(bytes) {
-  let s;
-  try {
-    s = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-  } catch {
-    s = String(bytes);
-  }
-  return s.replace(/\x1b/g, "\\e").replace(/[\x00-\x1f\x7f]/g, (c) =>
-    c === "\n" ? "\\n\n" :
-    c === "\r" ? "\\r" :
-    c === "\t" ? "\\t" :
-    `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`
-  );
-}
-
-// Pull out just the SGR, cursor-position, and high-interest escape codes
-// from a chunk — far less noise than the full byte dump.
-function summarizeAnsi(bytes) {
-  let s;
-  try { s = new TextDecoder("utf-8", { fatal: false }).decode(bytes); }
-  catch { return ""; }
-  const out = [];
-  // SGR (color/attribute) codes
-  const sgr = s.match(/\x1b\[[\d;]*m/g) || [];
-  for (const c of sgr) {
-    const params = c.slice(2, -1).split(";").filter(Boolean).map(Number);
-    if (!params.length) { out.push("SGR[RESET]"); continue; }
-    const notes = [];
-    for (let i = 0; i < params.length; i++) {
-      const p = params[i];
-      if (p === 0) notes.push("RESET");
-      else if (p === 1) notes.push("BOLD");
-      else if (p === 2) notes.push("DIM");
-      else if (p === 3) notes.push("ITALIC");
-      else if (p === 4) notes.push("*UNDERLINE*");
-      else if (p === 7) notes.push("*INVERSE*");
-      else if (p === 9) notes.push("STRIKE");
-      else if (p === 53) notes.push("*OVERLINE*");
-      else if (p >= 30 && p <= 37) notes.push(`fg${p - 30}`);
-      else if (p >= 40 && p <= 47) notes.push(`*bg${p - 40}*`);
-      else if (p >= 90 && p <= 97) notes.push(`fg${p - 90}+bright`);
-      else if (p >= 100 && p <= 107) notes.push(`*bg${p - 100}+bright*`);
-      else if (p === 38 && params[i + 1] === 5) { notes.push(`fg256:${params[i + 2]}`); i += 2; }
-      else if (p === 48 && params[i + 1] === 5) { notes.push(`*bg256:${params[i + 2]}*`); i += 2; }
-      else if (p === 38 && params[i + 1] === 2) { notes.push(`fgRGB:${params[i + 2]},${params[i + 3]},${params[i + 4]}`); i += 4; }
-      else if (p === 48 && params[i + 1] === 2) { notes.push(`*bgRGB:${params[i + 2]},${params[i + 3]},${params[i + 4]}*`); i += 4; }
-      else notes.push(`p${p}`);
-    }
-    out.push(`SGR[${notes.join(",")}]`);
-  }
-  // Suspect characters that could paint horizontal bars
-  const blocks = s.match(/[▀▄█▁▂▃▅▆▇─━═]/g) || [];
-  if (blocks.length) out.push(`GLYPHS:${[...new Set(blocks)].join("")}×${blocks.length}`);
-  return out.join(" ");
-}
 
 const xtermManager = (() => {
   // Retro-futuristic palette: deep grey base, orange + white accents.
@@ -506,53 +448,6 @@ function confirmDialog(message, { okText = "OK", cancelText = "Cancel", danger =
   });
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
-
-function relTime(ts) {
-  if (!ts) return "";
-  const d = typeof ts === "string" ? Date.parse(ts) / 1000 : ts;
-  const diff = Date.now() / 1000 - d;
-  if (diff < 5) return "now";
-  if (diff < 60) return `${Math.floor(diff)}s`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
-  return `${Math.floor(diff / 86400)}d`;
-}
-
-function fmtTime(ts) {
-  if (!ts) return "";
-  const d = typeof ts === "string" ? new Date(ts) : new Date(ts * 1000);
-  return d.toTimeString().slice(0, 8);
-}
-
-function truncCwd(cwd) {
-  if (!cwd) return "—";
-  const home = "/Users/";
-  if (cwd.startsWith(home)) {
-    const rest = cwd.slice(home.length);
-    const i = rest.indexOf("/");
-    if (i >= 0) return "~" + rest.slice(i);
-  }
-  return cwd;
-}
-
-const STATUS_GLYPH = {
-  running: "▸",
-  idle: "●",
-  needs_input: "!",
-  ended: "×",
-};
-const STATUS_TEXT = {
-  running: "RUNNING",
-  idle: "IDLE",
-  needs_input: "NEEDS INPUT",
-  ended: "ENDED",
-};
-
 /* List card */
 function renderListCard(inst) {
   const tpl = $("#listCardTpl");
@@ -647,35 +542,8 @@ function selectInstance(sid) {
 }
 
 /* List rendering (diff-aware) */
-function filtered() {
-  return state.instances.filter((i) => {
-    if (!state.showEnded && !i.alive) return false;
-    if (state.filter !== "all" && i.status !== state.filter) return false;
-    if (state.groupFilter && i.group !== state.groupFilter) return false;
-    if (state.query) {
-      const q = state.query.toLowerCase();
-      const hay = [
-        i.name, i.cwd, i.group,
-        ...(i.mcps?.global || []),
-        ...(i.mcps?.project || []),
-        ...(i.mcps?.explicit || []),
-      ].filter(Boolean).join(" ").toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
-}
-
-function listSignature(items) {
-  const freshBucket = Math.floor(Date.now() / 15000);
-  return items
-    .map((i) => [
-      i.session_id, i.status, i.name, i.group || "", i.pid || 0,
-      i.last_tool || "", i.hook_timestamp || 0, i.notification_message || "",
-      freshIntensity(i) > 0 ? freshBucket : 0,
-    ].join("|"))
-    .join("#") + `§${state.selectedSid || ""}§${state.query}§${state.filter}§${state.groupFilter || ""}§${state.showEnded}§${[...state.collapsedGroups].sort().join(",")}`;
-}
+const filtered = () => filterInstances(state.instances, state);
+const listSignature = (items) => listSignaturePure(items, state);
 
 function renderList() {
   const list = $("#list");
@@ -829,9 +697,16 @@ function renderPreview() {
   renderSummary(shell, session.summary);
   renderSubagents(shell, session.subagents || []);
 
-  // Stop button only enabled for alive sessions
+  // Stop + Terminal only enabled for alive sessions
   const stopBtn = $(".ph-stop", shell);
   if (stopBtn) stopBtn.disabled = !session.alive;
+  const openTermBtn = $(".ph-open-term", shell);
+  if (openTermBtn) {
+    openTermBtn.disabled = !session.alive;
+    openTermBtn.title = session.alive
+      ? "Open in native terminal"
+      : "Session has ended — no tmux to attach to";
+  }
 
   // Auto-focus the terminal on fresh selection
   if (sidChanged && session.alive) {
@@ -900,7 +775,12 @@ function wirePreviewActions(shell) {
       await api("POST", `/api/instances/${s.session_id}/open-terminal`);
       toast("Opened in terminal");
     } catch (e) {
-      toast(`Failed: ${e.message}`, { error: true });
+      const msg = /tmux session gone/i.test(e.message)
+        ? "Session has ended — no tmux to attach to"
+        : /not tmux-owned/i.test(e.message)
+          ? "This session isn't managed by AIM"
+          : `Failed: ${e.message}`;
+      toast(msg, { error: true });
     }
   });
 
@@ -1266,17 +1146,6 @@ function renderNav() {
   $$("[data-filter]", filterMenu).forEach((btn) => {
     btn.classList.toggle("active", state.filter === btn.dataset.filter && !state.groupFilter);
   });
-}
-
-const GROUP_COLORS = [
-  "#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#38d9a9",
-  "#4dabf7", "#748ffc", "#b197fc", "#e599f7", "#f06595",
-  "#ff922b", "#51cf66", "#3bc9db", "#5c7cfa", "#cc5de8",
-];
-function groupColor(name) {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
-  return GROUP_COLORS[Math.abs(h) % GROUP_COLORS.length];
 }
 
 function renderGroupNav() {
