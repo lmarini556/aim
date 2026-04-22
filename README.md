@@ -40,6 +40,25 @@ On first launch AIM installs its hooks into `~/.claude/settings.json` so Claude 
 
 ---
 
+## Tray & notifications
+
+![Tray icon](docs/tray.png)
+
+Three dots, one per status: **grey = idle**, **orange = needs input**, **green = running**. Only the states present across your sessions light up — so at a glance you know whether anything is waiting on you without opening the app.
+
+Eight possible combinations, eight pre-rendered icons. The tray tooltip shows the breakdown: `2 needs input · 1 running · 3 idle`. Click the tray icon to toggle the main window.
+
+**Notifications fire on state transitions:**
+
+| Transition | Notification | Sound |
+|---|---|---|
+| → needs input | `🟠 {instance name}` with Claude's prompt as the body | `Glass.aiff` |
+| running → idle | `🟢 {instance name}` — "Reply finished" | `Funk.aiff` |
+
+Notifications go through macOS Notification Center, so they respect Focus modes and Do Not Disturb. Clicking a notification raises the AIM window and focuses the originating instance. Disable sound from the **Settings** panel.
+
+---
+
 ## Architecture
 
 ```
@@ -52,7 +71,7 @@ On first launch AIM installs its hooks into `~/.claude/settings.json` so Claude 
      ├── WebView → http://127.0.0.1:7878/
      │    └── Vanilla JS + xterm.js (static/)
      │
-     ├── System tray (5 state icons)
+     ├── System tray (8 state icons)
      ├── 2s poller (state transitions → notifications + sound)
      └── Global shortcut (Cmd+Shift+C)
 
