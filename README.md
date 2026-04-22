@@ -4,6 +4,8 @@ Native macOS app for managing multiple concurrent [Claude Code](https://claude.c
 
 Every session runs inside tmux. Hooks write per-session state files that the app reads to render status, summaries, and transcripts.
 
+![AIM screenshot](docs/screenshot.png)
+
 ---
 
 ## Install

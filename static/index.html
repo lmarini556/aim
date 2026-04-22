@@ -7,7 +7,7 @@
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23ff6b1a'/><text x='32' y='43' text-anchor='middle' font-family='monospace' font-size='28' font-weight='900' fill='%23000'>AIM</text></svg>" />
     <link rel="stylesheet" href="/static/vendor/inter.css" />
     <link rel="stylesheet" href="/static/vendor/xterm.min.css" />
-    <link rel="stylesheet" href="/static/style.css?v=78" />
+    <link rel="stylesheet" href="/static/style.css?v=81" />
   </head>
   <body>
     <aside id="sidebar">
@@ -84,7 +84,7 @@
     </section>
 
     <template id="listCardTpl">
-      <button class="list-card" data-sid="">
+      <div class="list-card" role="button" tabindex="0" data-sid="">
         <span class="lc-stripe"></span>
         <span class="lc-sprite"></span>
         <div class="lc-body">
@@ -98,7 +98,7 @@
           <div class="lc-notif"></div>
           <div class="lc-meta"></div>
         </div>
-      </button>
+      </div>
     </template>
 
     <template id="previewTpl">
@@ -236,6 +236,6 @@
     <script src="/static/vendor/xterm-addon-webgl.min.js"></script>
     <script src="/static/vendor/xterm-addon-canvas.min.js"></script>
     <script src="/static/sprite.js?v=57"></script>
-    <script type="module" src="/static/app.js?v=90"></script>
+    <script type="module" src="/static/app.js?v=91"></script>
   </body>
 </html>

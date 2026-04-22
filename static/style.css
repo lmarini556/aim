@@ -482,6 +482,7 @@ body.list-resizing * { cursor: col-resize !important; }
   font-weight: 800;
   padding: 16px 6px 6px 10px;
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 8px;
   position: relative;
@@ -537,6 +538,7 @@ body.list-resizing * { cursor: col-resize !important; }
   border-radius: var(--radius);
   padding: 0;
   display: flex;
+  flex-shrink: 0;
   text-align: left;
   cursor: pointer;
   transition: background 0.1s var(--ease), border-color 0.1s var(--ease);
@@ -743,7 +745,7 @@ body.list-resizing * { cursor: col-resize !important; }
 .lc-body {
   flex: 1;
   min-width: 0;
-  padding: 10px 12px 11px;
+  padding: 10px 12px 12px;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -821,13 +823,15 @@ body.list-resizing * { cursor: col-resize !important; }
   gap: 4px;
   flex-wrap: wrap;
   margin-top: 4px;
+  line-height: 1.4;
 }
 .lc-tag {
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--muted-strong);
   font-size: 10px;
-  padding: 1px 6px;
+  line-height: 1.4;
+  padding: 2px 6px;
   border-radius: 4px;
   font-weight: 500;
   font-variant-numeric: tabular-nums;

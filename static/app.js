@@ -471,6 +471,12 @@ function renderListCard(inst) {
     selectInstance(inst.session_id);
     setTimeout(() => xtermManager.focus(), 250);
   });
+  node.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      node.click();
+    }
+  });
   wireDragAndDrop(node, inst.session_id);
   return node;
 }
